@@ -1,13 +1,14 @@
-name: 07-fund_warning_report.yml
+name: 07-fund_warning_report_v5_1.yml
+
 on:
-  # 1. 自动触发条件：当以下文件被修改并推送到仓库时，工作流自动运行
+  # 1. 自动触发条件：相关代码或数据更新时运行
   push:
     paths:
-      - 'analyzer_V5.py'
+      - 'analyzer_V5.py' # 建议将新脚本命名为 analyzer_V5.py 或在此处修改
       - '.github/workflows/07-fund_warning_report.yml'
       - 'fund_data/**.csv'
-      
 
+  # 2. 定时任务：每天北京时间凌晨 02:00 运行 (UTC 18:00)
   schedule:
     - cron: '0 18 * * *' 
     
@@ -16,7 +17,7 @@ on:
 
 jobs:
   analyze_funds:
-    # 设置时区为北京时间，确保报告中的时间戳正确
+    # 设置环境时区为北京时间
     env:
       TZ: Asia/Shanghai
       
@@ -24,50 +25,48 @@ jobs:
 
     steps:
       - name: Checkout repository
-        # 确保拉取完整历史记录，以便后续 git rebase/pull 操作正确执行
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 
+          fetch-depth: 0 # 拉取完整记录以支持 rebase
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 安装 pandas 和 requests，确保脚本运行环境完整
-          pip install pandas requests
+          # 核心依赖：pandas, numpy 用于计算；pytz 用于时间戳
+          pip install pandas numpy pytz
 
-      - name: Run fund analysis script
+      - name: Run fund analysis script (V5.1)
         id: analysis
         run: python analyzer_V5.py
 
       - name: Commit and push report
-        # 仅在脚本成功运行后提交文件
         if: success()
         run: |
           # 配置 Git 身份
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          # 查找并添加所有生成的 Markdown 报告文件
-          # 脚本生成的文件名格式为 fund_warning_report_v5_merged_table_YYYYMMDD_HHMMSS.md
-          git add '**/fund_warning_report_*.md'
+          # 关键修改：匹配 V5.1 脚本生成的文件名格式 Report_V5_1_*.md
+          # 同时兼容旧版命名的前缀匹配
+          git add '**/Report_V5_1_*.md' || true
+          git add '**/fund_warning_report_*.md' || true
           
-          # 检查是否有文件更改，如果没有则退出
+          # 检查是否有新报告生成
           if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes to commit. Exiting."
+            echo "No new report changes to commit. Exiting."
             exit 0
           fi
           
           # 提交更改
-          git commit -m "Automated fund analysis report update: $(date +%Y-%m-%d)"
+          git commit -m "📈 [Automated] Fund V5.1 Analysis Report: $(date +'%Y-%m-%d %H:%M')"
           
-          # 解决非快进(non-fast-forward)错误：拉取远程更改并 rebase
-          # 这确保了本地提交基于远程的最新提交，解决定时任务之间的冲突
+          # 冲突处理：拉取最新远程提交并 rebase
           git pull --rebase
           
-          # 推送更改
+          # 推送
           git push
