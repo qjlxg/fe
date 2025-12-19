@@ -1,0 +1,47 @@
+name: Update ETF Data
+
+on:
+  schedule:
+    # 北京时间 23:00 对应 UTC 15:00
+    - cron: '0 15 * * *'
+  push:
+    # 当脚本或 yml 本身变动时触发
+    paths:
+      - 'download_etf.py'
+      - '.github/workflows/main.yml'
+      - 'etf.txt'
+  workflow_dispatch: # 支持手动运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install akshare pandas
+
+      - name: Run download script
+        run: python download_etf.py
+
+      - name: Commit and Push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add fund_data/*.csv
+          # 只有在有变动时才提交，防止工作流报错
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto-update ETF data: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
