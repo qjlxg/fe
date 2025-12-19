@@ -1,33 +1,28 @@
-name: 07-fund_warning_report
+name: 07-fund_warning_report_v5.8
 
 on:
-  # 1. 自动触发条件：代码或数据更新时运行
   push:
     paths:
-      - 'analyzer_V5.py'
+      - 'analyzer_V5.py'  # 确保这里匹配你的最新文件名
       - '.github/workflows/**'
       - 'fund_data/**'
-
-  # 2. 定时任务：北京时间每天凌晨 02:00 运行 (UTC 18:00)
   schedule:
-    - cron: '0 18 * * *' 
-    
-  # 3. 允许手动触发
-  workflow_dispatch:
+    # 每天北京时间 15:15 运行（A股收盘后立即分析）
+    # UTC 时间 07:15
+    - cron: '15 7 * * *'
+  workflow_dispatch: # 允许手动点按钮运行
 
 jobs:
   analyze_funds:
-    # 设置环境时区为北京时间
     env:
       TZ: Asia/Shanghai
-      
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整历史记录以支持 rebase
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,39 +32,34 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy pytz
+          pip install pandas numpy
 
       - name: Run fund analysis script
         id: analysis
+        # 注意：这里改为你最新的文件名
         run: python analyzer_V5.py
 
-      - name: Commit and push report
+      - name: Commit and push changes
         if: success()
         run: |
-          # 1. 配置 Git 身份
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          # 2. 通用添加逻辑：添加所有新生成的报告文件
-          # 使用通配符 Report_*.md 匹配所有版本（V5.1, V5.2 等）
-          # 同时添加日志文件方便排查问题
-          git add Report_*.md || true
-          git add fund_analysis.log || true
-          git add **/Report_*.md || true
+          # 1. 添加所有类型的报告
+          git add Trading_Decision_Report_*.md || true
+          git add Strategy_Pro_Report_*.md || true
           
-          # 3. 核心检查：判断暂存区是否有变动
-          # git status --porcelain 会列出所有变动，如果为空则不提交
+          # 2. 关键：添加复盘日志文件，这样历史记录才不会丢
+          git add history_signals.csv || true
+          
+          # 检查是否有文件变动
           if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes detected (No new reports). Skipping commit."
+            echo "No changes detected. Skipping commit."
             exit 0
           fi
           
-          # 4. 提交更改
-          git commit -m "📈 [Automated] Fund Analysis Report: $(date +'%Y-%m-%d %H:%M')"
+          git commit -m "📈 [V5.8] 自动化决策报告与日志同步: $(date +'%Y-%m-%d %H:%M')"
           
-          # 5. 处理并发冲突
-          # 定时任务执行时，如果本地有新提交，使用 rebase 保持提交线整洁
+          # 处理并发冲突
           git pull --rebase origin main
-          
-          # 6. 推送到远程仓库
           git push origin main
