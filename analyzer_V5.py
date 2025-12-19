@@ -5,28 +5,31 @@ import numpy as np
 from datetime import datetime
 import logging
 
-# --- 核心配置区 ---
-TOTAL_ASSETS = 100000              # 模拟总资产，用于计算建议买入金额
+# --- 核心配置 ---
+TOTAL_ASSETS = 100000              
 FUND_DATA_DIR = 'fund_data'
-BENCHMARK_CODE = '510300'          # 天气风向标（沪深300）
+BENCHMARK_CODE = '510300'          
 REPORT_BASE_NAME = 'Trading_Decision_Report'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 def load_data(filepath):
-    """适配 CSV 格式：日期,开盘,收盘,最高,最低,成交量"""
     try:
         try:
             df = pd.read_csv(filepath, encoding='utf-8')
         except:
             df = pd.read_csv(filepath, encoding='gbk')
         
-        column_map = {'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low'}
+        # 适配你的 CSV：日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+        column_map = {
+            '日期': 'date', '收盘': 'close', '最高': 'high', '最低': 'low', 
+            '换手率': 'turnover', '成交量': 'volume'
+        }
         df = df.rename(columns=column_map)
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
         
-        for col in ['close', 'high', 'low']:
+        for col in ['close', 'high', 'low', 'turnover']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         return df.dropna(subset=['close'])
@@ -34,7 +37,6 @@ def load_data(filepath):
         return None
 
 def get_market_weather():
-    """环境感应：判定大盘所处的‘季节’"""
     path = os.path.join(FUND_DATA_DIR, f"{BENCHMARK_CODE}.csv")
     if not os.path.exists(path): return 0, "未知天气", 1.0
     df = load_data(path)
@@ -48,12 +50,11 @@ def get_market_weather():
     if bias < 1:  return bias, "🌤️ 早春 (蓄势，正常执行)", 1.0
     return bias, "☀️ 盛夏 (亢奋，警惕追高)", 0.5
 
-def check_history_win_rate(df, lookback=250):
-    """回测该标的过去一年中类似信号的胜率（T+5 涨幅 > 2% 算成功）"""
+def check_history_win_rate(df):
+    """回测历史信号胜率"""
     if len(df) < 60: return "N/A"
-    temp = df.tail(lookback).copy()
+    temp = df.tail(250).copy()
     temp['MA5'] = temp['close'].rolling(5).mean()
-    # 简易RSI
     delta = temp['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -63,8 +64,7 @@ def check_history_win_rate(df, lookback=250):
     for i in range(20, len(temp)-6):
         if temp['rsi'].iloc[i] < 35 and temp['close'].iloc[i] > temp['MA5'].iloc[i]:
             total += 1
-            future_max = temp['close'].iloc[i+1:i+6].max()
-            if (future_max - temp['close'].iloc[i]) / temp['close'].iloc[i] >= 0.02:
+            if (temp['close'].iloc[i+5] - temp['close'].iloc[i]) / temp['close'].iloc[i] >= 0.02:
                 success += 1
     return f"{success/total:.0%}" if total > 0 else "0%"
 
@@ -75,29 +75,32 @@ def analyze_logic(df, bias_val, weather_multiplier):
     dynamic_rsi_limit = 35 + (bias_val * 1.2)
     df['MA5'] = df['close'].rolling(5).mean()
     
-    # 2. ATR 及 风险计算
-    tr = pd.concat([
-        (df['high'] - df['low']),
-        (df['high'] - df['close'].shift()).abs(),
-        (df['low'] - df['close'].shift()).abs()
-    ], axis=1).max(axis=1)
+    # 2. 换手率分析：计算过去10天的平均换手率
+    df['TO_MA10'] = df['turnover'].rolling(10).mean()
+    last_turnover = df['turnover'].iloc[-1]
+    avg_turnover = df['TO_MA10'].iloc[-1]
+    # 换手率倍率：今天的换手率是平均水平的多少倍
+    turnover_ratio = last_turnover / avg_turnover if avg_turnover > 0 else 1.0
+    
+    # 3. ATR 风险计算
+    tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
 
-    # 3. RSI
+    # 4. RSI & 回撤
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df['rsi'] = 100 - (100 / (1 + gain/loss.replace(0, 0.001)))
-    
-    # 4. 回撤
-    roll_max = df['close'].rolling(window=20, min_periods=1).max()
-    df['drawdown'] = (df['close'] - roll_max) / roll_max
+    df['drawdown'] = (df['close'] - df['close'].rolling(20).max()) / df['close'].rolling(20).max()
 
     last = df.iloc[-1]
+    
+    # 判定逻辑：加入换手率因子（防止在“无人问津”的死水中买入）
+    # 如果换手率太低（不到平均值的0.8倍），即便价格涨了也可能是假动作
+    is_active = turnover_ratio > 0.8 
     is_right_side = last['close'] > last['MA5'] and (last['MA5'] >= df['MA5'].iloc[-2] * 0.999)
     is_oversold = last['rsi'] < dynamic_rsi_limit
 
-    # 初始状态
     sort_weight = 1
     decision = "🔴 观望 (未见止跌)"
     pos_ratio = "0%"
@@ -105,8 +108,8 @@ def analyze_logic(df, bias_val, weather_multiplier):
     win_rate = check_history_win_rate(df)
 
     if abs(last['drawdown']) >= 0.045:
-        if is_right_side and is_oversold:
-            decision = "🟢 买入 (环境确认)"
+        if is_right_side and is_oversold and is_active:
+            decision = "🟢 买入 (放量确认)" if turnover_ratio > 1.2 else "🟢 买入 (环境确认)"
             sort_weight = 3
             stop_price = last['close'] - (2 * last['atr'])
             risk_unit = last['close'] - stop_price
@@ -119,7 +122,8 @@ def analyze_logic(df, bias_val, weather_multiplier):
             
         return {
             'code': "", 'close': last['close'], 'rsi': last['rsi'], 'drawdown': last['drawdown'],
-            'pos': pos_ratio, 'stop': stop_price, 'decision': decision, 'weight': sort_weight, 'win': win_rate
+            'pos': pos_ratio, 'stop': stop_price, 'decision': decision, 
+            'weight': sort_weight, 'win': win_rate, 'to_ratio': turnover_ratio
         }
     return None
 
@@ -140,23 +144,19 @@ def main():
                 res['code'] = code
                 results.append(res)
 
-    # 核心：按买入强度排序
     results = sorted(results, key=lambda x: x['weight'], reverse=True)
 
     report_name = f"{REPORT_BASE_NAME}_{file_time}.md"
     with open(report_name, 'w', encoding='utf-8') as f:
-        f.write(f"# 基金实战决策报告 (V5.8 排序增强版)\n")
-        f.write(f"**分析时间**: {run_time} | **市场环境**: {weather_desc}\n\n")
-        f.write(f"| 代码 | 现价 | RSI | 回撤 | 建议仓位 | 止损参考 | 信号胜率 | 最终决策 |\n")
-        f.write(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+        f.write(f"# 基金实战决策报告 (V5.8 换手率增强版)\n")
+        f.write(f"**分析时间**: {run_time} | **环境**: {weather_desc}\n\n")
+        f.write(f"| 代码 | 现价 | RSI | 20日回撤 | 换手倍率 | 建议仓位 | 止损参考 | 信号胜率 | 最终决策 |\n")
+        f.write(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
         for r in results:
             stop_str = f"{r['stop']:.3f}" if r['stop'] > 0 else "0.000"
-            f.write(f"| {r['code']} | {r['close']:.3f} | {r['rsi']:.1f} | {r['drawdown']:.1%} | {r['pos']} | {stop_str} | {r['win']} | **{r['decision']}** |\n")
-            
-            # 复盘日志保存
-            with open('history_signals.csv', 'a', encoding='utf-8') as log:
-                if log.tell() == 0: log.write("日期,代码,价格,决策,仓位,天气\n")
-                log.write(f"{run_time},{r['code']},{r['close']},{r['decision']},{r['pos']},{weather_desc}\n")
+            # 换手倍率 > 1.2 加粗显示，表示有资金进场
+            to_str = f"**{r['to_ratio']:.2f}**" if r['to_ratio'] > 1.2 else f"{r['to_ratio']:.2f}"
+            f.write(f"| {r['code']} | {r['close']:.3f} | {r['rsi']:.1f} | {r['drawdown']:.1%} | {to_str} | {r['pos']} | {stop_str} | {r['win']} | **{r['decision']}** |\n")
 
 if __name__ == "__main__":
     main()
