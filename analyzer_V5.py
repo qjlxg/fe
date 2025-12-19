@@ -3,113 +3,108 @@ import glob
 import os
 import numpy as np
 from datetime import datetime
-import logging
 
-# --- V5.5 决策版配置 ---
+# --- 实战配置区 ---
+TOTAL_ASSETS = 100000        # 假设你的总资金量（用于计算仓位）
 FUND_DATA_DIR = 'fund_data'
-MIN_MONTH_DRAWDOWN = 0.05           # 5%回撤基础
-MIN_TURNOVER_RATE = 1.0             # 换手率门槛
-REPORT_BASE_NAME = 'Trading_Decision_Report'
+BENCHMARK_CODE = '510300'    # 沪深300作为天气预报风向标
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# --- 1. 天气预报逻辑 ---
+def get_market_weather():
+    """根据大盘偏离度判定天气"""
+    path = os.path.join(FUND_DATA_DIR, f"{BENCHMARK_CODE}.csv")
+    if not os.path.exists(path): return 0, "未知", 1.0
+    
+    df = pd.read_csv(path).tail(30)
+    df['MA20'] = df['close'].rolling(20).mean()
+    bias = ((df['close'].iloc[-1] - df['MA20'].iloc[-1]) / df['MA20'].iloc[-1]) * 100
+    
+    if bias < -4: return bias, "❄️ 深冬（极度严寒，提级审核）", 0.6  # 仓位系数
+    if bias < -2: return bias, "🌨️ 初冬（微寒，严格过滤）", 0.8
+    if bias < 1:  return bias, "🌤️ 早春（蓄势，正常执行）", 1.0
+    return bias, "☀️ 盛夏（亢奋，警惕追高）", 0.5
 
-def load_data(filepath):
-    try:
-        try:
-            df = pd.read_csv(filepath, encoding='utf-8')
-        except:
-            df = pd.read_csv(filepath, encoding='gbk')
-        column_map = {'日期': 'date', 'Date': 'date', '收盘': 'close', 'Close': 'close', 
-                      '成交量': 'volume', 'Volume': 'volume', '换手率': 'turnover'}
-        df = df.rename(columns=column_map)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        for col in ['close', 'volume', 'turnover']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df.dropna(subset=['close'])
-    except:
-        return None
-
-def analyze_logic(df):
+# --- 2. 核心分析逻辑 ---
+def analyze_logic(df, bias_val, weather_multiplier):
     if len(df) < 30: return None
     
-    # 1. 指标计算
+    # 动态调整阈值：天气越冷，RSI门槛越低（要求更超跌）
+    base_rsi_limit = 35
+    dynamic_rsi_limit = base_rsi_limit + (bias_val * 1.5) 
+    
+    # 计算指标
     df['MA5'] = df['close'].rolling(5).mean()
     df['MA20'] = df['close'].rolling(20).mean()
-    df['bias'] = (df['close'] - df['MA20']) / df['MA20'] * 100
     
-    # RSI
+    # ATR计算（用于动态止损和仓位）
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    
+    # RSI计算
     delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 0.001))))
-    
-    # 回撤
-    roll_max = df['close'].rolling(window=20, min_periods=1).max()
-    df['drawdown'] = (df['close'] - roll_max) / roll_max
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    df['rsi'] = 100 - (100 / (1 + gain/loss.replace(0, 0.001)))
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
     
-    # 2. 决策逻辑 (核心修改)
-    # 条件1：价格站上MA5 (右侧确认)
-    is_right_side = last['close'] > last['MA5']
-    # 条件2：超跌
-    is_oversold = last['rsi'] < 40 or last['bias'] < -4.0
+    # 判定条件
+    is_oversold = last['rsi'] < dynamic_rsi_limit
+    is_stop_falling = last['close'] > last['MA5'] and (last['MA5'] >= df['MA5'].iloc[-2])
     
-    decision = "🔴 继续观望 (未止跌)"
-    if abs(last['drawdown']) >= MIN_MONTH_DRAWDOWN:
-        if is_right_side and is_oversold:
-            decision = "🟢 买入参考 (已站稳)"
-        elif is_oversold:
-            decision = "🟡 预警: 待站稳MA5"
-            
+    if is_oversold and is_stop_falling:
+        # 仓位计算：单笔风险不超过总资产的 1%
+        stop_loss_price = last['close'] - (2 * last['atr'])
+        risk_per_share = last['close'] - stop_loss_price
+        # 建议金额 = (总资产 * 1%) / 风险间距 * 天气系数
+        suggested_amt = (TOTAL_ASSETS * 0.01) / (risk_per_share / last['close']) * weather_multiplier
+        pos_ratio = suggested_amt / TOTAL_ASSETS
+        
         return {
-            'code': "", 'close': last['close'], 'drawdown': last['drawdown'],
-            'rsi': last['rsi'], 'bias': last['bias'], 'decision': decision
+            'close': last['close'],
+            'rsi': last['rsi'],
+            'stop_loss': stop_loss_price,
+            'pos_ratio': pos_ratio,
+            'weather_limit': dynamic_rsi_limit
         }
     return None
 
+# --- 3. 自动化报告与记录 ---
 def main():
-    # 获取当前精确时间
-    run_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    file_time = datetime.now().strftime('%Y%m%d_%H%M')
-
-    if not os.path.exists(FUND_DATA_DIR):
-        print("错误：未找到数据目录")
-        return
-
-    files = glob.glob(os.path.join(FUND_DATA_DIR, "*.csv"))
+    bias_val, weather_desc, weather_multiplier = get_market_weather()
     results = []
-    for f in files:
-        code = os.path.splitext(os.path.basename(f))[0]
-        df = load_data(f)
-        if df is not None:
-            res = analyze_logic(df)
-            if res:
-                res['code'] = code
-                results.append(res)
-
-    # 排序：决策级别高的排在前面
-    results = sorted(results, key=lambda x: x['decision'], reverse=True)
-
-    report_name = f"{REPORT_BASE_NAME}_{file_time}.md"
-    with open(report_name, 'w', encoding='utf-8') as f:
-        f.write(f"# 基金实战决策报告\n")
-        f.write(f"**分析执行时间**: {run_time} (北京时间)\n\n")
-        f.write("## 💡 决策建议说明\n")
-        f.write("- **🟢 买入参考**: 满足回撤条件，且价格已站上 5 日线，短期跌势逆转。\n")
-        f.write("- **🔴 继续观望**: 虽然跌得多，但仍被均线压制，此时买入容易被套。\n\n")
-        
-        if not results:
-            f.write("### ❌ 今日市场无符合回撤 5% 以上的标的。")
-        else:
-            f.write("| 基金代码 | 最新价 | 20日回撤 | RSI | 乖离率 | 👈 最终动作决策 |\n")
-            f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
-            for r in results:
-                f.write(f"| {r['code']} | {r['close']:.3f} | {r['drawdown']:.2%} | {r['rsi']:.1f} | {r['bias']:.1f}% | **{r['decision']}** |\n")
     
-    print(f"决策完成！报告生成时间：{run_time}")
+    for f in glob.glob(os.path.join(FUND_DATA_DIR, "*.csv")):
+        code = os.path.splitext(os.path.basename(f))[0]
+        if code == BENCHMARK_CODE: continue
+        
+        df = pd.read_csv(f)
+        res = analyze_logic(df, bias_val, weather_multiplier)
+        if res:
+            res['code'] = code
+            results.append(res)
+
+    # 打印报告
+    print(f"\n{'='*50}")
+    print(f"ETF实战决策报告 V5.8 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"当前市场天气：{weather_desc}")
+    print(f"动态RSI门槛：{35 + (bias_val * 1.5):.1f}")
+    print(f"{'='*50}\n")
+    
+    if not results:
+        print("今日无符合条件的优质‘种子’。")
+    else:
+        print(f"{'代码':<8} | {'现价':<6} | {'RSI':<5} | {'建议仓位':<8} | {'止损价':<6}")
+        for r in results:
+            print(f"{r['code']:<8} | {r['close']:<8.3f} | {r['rsi']:<7.1f} | {r['pos_ratio']:<11.1%} | {r['stop_loss']:.3f}")
+            
+            # 自动记录复盘日志
+            with open('history_signals.csv', 'a', encoding='utf-8') as f_log:
+                f_log.write(f"{datetime.now().date()},{r['code']},{r['close']},{r['pos_ratio']:.2%},{r['stop_loss']:.3f},{weather_desc}\n")
 
 if __name__ == "__main__":
+    if not os.path.exists('history_signals.csv'):
+        with open('history_signals.csv', 'w') as f: f.write("日期,代码,价格,仓位,止损价,天气\n")
     main()
