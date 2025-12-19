@@ -5,12 +5,11 @@ import numpy as np
 from datetime import datetime
 import logging
 
-# --- V5.4 高胜率/ETF专用配置参数 ---
+# --- V5.5 决策版配置 ---
 FUND_DATA_DIR = 'fund_data'
-MIN_MONTH_DRAWDOWN = 0.05           # 20日内回撤门槛 (5%)
-MIN_TURNOVER_RATE = 1.0             # 换手率门槛 (1%)
-BIAS_THRESHOLD = -4.5               # 乖离率预警 (ETF跌破均线4.5%通常是极限)
-REPORT_BASE_NAME = 'Report_V5_4'
+MIN_MONTH_DRAWDOWN = 0.05           # 5%回撤基础
+MIN_TURNOVER_RATE = 1.0             # 换手率门槛
+REPORT_BASE_NAME = 'Trading_Decision_Report'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -20,84 +19,64 @@ def load_data(filepath):
             df = pd.read_csv(filepath, encoding='utf-8')
         except:
             df = pd.read_csv(filepath, encoding='gbk')
-
         column_map = {'日期': 'date', 'Date': 'date', '收盘': 'close', 'Close': 'close', 
                       '成交量': 'volume', 'Volume': 'volume', '换手率': 'turnover'}
         df = df.rename(columns=column_map)
-        
-        required = ['date', 'close', 'volume', 'turnover']
-        for col in required:
-            if col not in df.columns: df[col] = 0
-                
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
         for col in ['close', 'volume', 'turnover']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            
         return df.dropna(subset=['close'])
-    except Exception as e:
+    except:
         return None
 
 def analyze_logic(df):
-    """
-    针对 ETF 优化的过滤逻辑
-    """
     if len(df) < 30: return None
     
-    # 1. 基础指标计算 (先计算，再引用，修复 KeyError)
-    # 计算均线
+    # 1. 指标计算
     df['MA5'] = df['close'].rolling(5).mean()
     df['MA20'] = df['close'].rolling(20).mean()
-    
-    # 计算乖离率
     df['bias'] = (df['close'] - df['MA20']) / df['MA20'] * 100
     
-    # 计算20日最大回撤
-    roll_max = df['close'].rolling(window=20, min_periods=1).max()
-    df['drawdown'] = (df['close'] - roll_max) / roll_max
-    
-    # 计算 RSI(14)
+    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 0.001))))
+    
+    # 回撤
+    roll_max = df['close'].rolling(window=20, min_periods=1).max()
+    df['drawdown'] = (df['close'] - roll_max) / roll_max
 
-    # 2. 提取最新数据
     last = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # 3. 核心信号判定
-    signals = []
+    # 2. 决策逻辑 (核心修改)
+    # 条件1：价格站上MA5 (右侧确认)
+    is_right_side = last['close'] > last['MA5']
+    # 条件2：超跌
+    is_oversold = last['rsi'] < 40 or last['bias'] < -4.0
     
-    # 【信号A】底背离确认：价格新低但动能(RSI)没创新低
-    # 这是减少假信号的关键：说明下跌速度正在放缓
-    if last['close'] < prev['close'] and last['rsi'] > prev['rsi'] and last['rsi'] < 40:
-        signals.append("RSI底背离")
-
-    # 【信号B】止跌确认：价格必须重新站上 5 日均线
-    # 目的：不接飞刀。如果还在 MA5 下方，说明跌势未止
-    if last['close'] > last['MA5'] and prev['close'] <= prev['MA5']:
-        if last['bias'] < -2.0: # 稍微超跌即可
-            signals.append("MA5金叉(止跌确认)")
-
-    # 4. 最终复合筛选
-    # 必须满足：20日大回撤 + (背离 或 止跌) + 换手率足够
-    if abs(last['drawdown']) >= MIN_MONTH_DRAWDOWN and last['turnover'] >= MIN_TURNOVER_RATE:
-        if signals:
-            return {
-                'code': "", 
-                'close': last['close'],
-                'drawdown': last['drawdown'],
-                'rsi': last['rsi'],
-                'bias': last['bias'],
-                'turnover': last['turnover'],
-                'action': " | ".join(signals)
-            }
+    decision = "🔴 继续观望 (未止跌)"
+    if abs(last['drawdown']) >= MIN_MONTH_DRAWDOWN:
+        if is_right_side and is_oversold:
+            decision = "🟢 买入参考 (已站稳)"
+        elif is_oversold:
+            decision = "🟡 预警: 待站稳MA5"
+            
+        return {
+            'code': "", 'close': last['close'], 'drawdown': last['drawdown'],
+            'rsi': last['rsi'], 'bias': last['bias'], 'decision': decision
+        }
     return None
 
 def main():
+    # 获取当前精确时间
+    run_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    file_time = datetime.now().strftime('%Y%m%d_%H%M')
+
     if not os.path.exists(FUND_DATA_DIR):
-        os.makedirs(FUND_DATA_DIR)
+        print("错误：未找到数据目录")
         return
 
     files = glob.glob(os.path.join(FUND_DATA_DIR, "*.csv"))
@@ -111,22 +90,26 @@ def main():
                 res['code'] = code
                 results.append(res)
 
-    # 按回撤幅度排序
-    results = sorted(results, key=lambda x: x['drawdown'])
+    # 排序：决策级别高的排在前面
+    results = sorted(results, key=lambda x: x['decision'], reverse=True)
 
-    report_name = f"{REPORT_BASE_NAME}_{datetime.now().strftime('%Y%m%d')}.md"
+    report_name = f"{REPORT_BASE_NAME}_{file_time}.md"
     with open(report_name, 'w', encoding='utf-8') as f:
-        f.write(f"# 基金高胜率分析报告 (V5.4)\n\n")
-        f.write("> **防亏损机制**：增加了 MA5 止跌确认（不接飞刀）和 RSI 底背离过滤。\n\n")
+        f.write(f"# 基金实战决策报告\n")
+        f.write(f"**分析执行时间**: {run_time} (北京时间)\n\n")
+        f.write("## 💡 决策建议说明\n")
+        f.write("- **🟢 买入参考**: 满足回撤条件，且价格已站上 5 日线，短期跌势逆转。\n")
+        f.write("- **🔴 继续观望**: 虽然跌得多，但仍被均线压制，此时买入容易被套。\n\n")
+        
         if not results:
-            f.write("今日市场未发现满足“止跌确认”的高胜率信号。\n")
+            f.write("### ❌ 今日市场无符合回撤 5% 以上的标的。")
         else:
-            f.write("| 代码 | 价格 | 20日回撤 | RSI | 乖离率 | 信号提示 |\n")
+            f.write("| 基金代码 | 最新价 | 20日回撤 | RSI | 乖离率 | 👈 最终动作决策 |\n")
             f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
             for r in results:
-                f.write(f"| {r['code']} | {r['close']:.3f} | {r['drawdown']:.2%} | {r['rsi']:.1f} | {r['bias']:.1f}% | **{r['action']}** |\n")
+                f.write(f"| {r['code']} | {r['close']:.3f} | {r['drawdown']:.2%} | {r['rsi']:.1f} | {r['bias']:.1f}% | **{r['decision']}** |\n")
     
-    print(f"分析完成，报告已生成：{report_name}")
+    print(f"决策完成！报告生成时间：{run_time}")
 
 if __name__ == "__main__":
     main()
