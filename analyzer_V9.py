@@ -1,117 +1,140 @@
 import pandas as pd
 import numpy as np
 import glob, os, warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 
-# --- 核心实盘配置 ---
+# --- 核心配置 ---
 CONFIG = {
-    'CAPITAL': 100000,        # 初始本金
-    'MAX_HOLDINGS': 3,        # 提高分散度：最多持仓3只
-    'RISK_PER_TRADE': 0.008,   # 严格风控：单笔风险控制在0.8%
-    'TOTAL_POS_LIMIT': 0.7,   # 总仓位上限70%
+    'TOTAL_CAPITAL': 100000,    # 模拟实盘资金
+    'MAX_HOLDINGS': 3,          # 最大持仓数
+    'RISK_PER_TRADE': 0.01,     # 单笔风险 1%
     'DATA_DIR': 'fund_data',
+    'EXCEL_DB': 'ETF列表.xlsx',
     'REPORT_FILE': 'README.md',
-    'FEE_SLIPPAGE': 0.001     # 预留千一的滑点+佣金成本
+    'MIN_SHARPE': 0.2,          # 中等强度：允许性价比一般的标的进入
+    'MIN_DD': -0.03,            # 中等强度：回撤3%即进入监控
 }
 
-class QuantEngine:
+# --- 1. 深度匹配引擎 ---
+def load_fund_db():
+    fund_db = {}
+    if not os.path.exists(CONFIG['EXCEL_DB']):
+        print(f"❌ 找不到数据库: {CONFIG['EXCEL_DB']}")
+        return fund_db
+    try:
+        df = pd.read_excel(CONFIG['EXCEL_DB'], dtype=str, engine='openpyxl')
+        df.columns = [str(c).strip() for c in df.columns]
+        c_code = next((c for c in df.columns if '代码' in c), None)
+        c_name = next((c for c in df.columns if '简称' in c or '名称' in c), None)
+        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '标的', '追踪', '行业'])), None)
+
+        for _, row in df.iterrows():
+            raw_code = str(row[c_code]).strip()
+            clean_code = "".join(filter(str.isdigit, raw_code)).zfill(6)
+            if clean_code and len(clean_code) == 6:
+                fund_db[clean_code] = {
+                    'name': str(row[c_name]).strip() if not pd.isna(row[c_name]) else "未知基金",
+                    'index': str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "行业/指数"
+                }
+        return fund_db
+    except Exception as e:
+        print(f"❌ 解析 Excel 失败: {e}")
+        return fund_db
+
+# --- 2. 策略引擎 ---
+class StrategyV10:
     @staticmethod
-    def calculate_metrics(df):
-        """精准计算：增加趋势斜率与波动稳定性"""
-        # 1. 精准 TR & ATR 计算
+    def get_metrics(df):
+        # 字段兼容处理
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        mapping = {'收盘': 'close', '成交额': 'amount', '成交量': 'volume', '最高': 'high', '最低': 'low'}
+        df.rename(columns=mapping, inplace=True)
+        
+        # 指标计算
+        df['ma5'] = df['close'].rolling(5).mean()
+        df['ma10'] = df['close'].rolling(10).mean()
+        df['ma20'] = df['close'].rolling(20).mean()
+        
+        # ATR 计算
         df['h_l'] = df['high'] - df['low']
         df['h_pc'] = (df['high'] - df['close'].shift(1)).abs()
         df['l_pc'] = (df['low'] - df['close'].shift(1)).abs()
         df['tr'] = df[['h_l', 'h_pc', 'l_pc']].max(axis=1)
         df['atr'] = df['tr'].rolling(14).mean()
         
-        # 2. 趋势斜率 (防假突破：要求MA20走平或向上)
-        df['ma20'] = df['close'].rolling(20).mean()
-        df['ma5'] = df['close'].rolling(5).mean()
-        df['slope_20'] = (df['ma20'] - df['ma20'].shift(5)) / 5
-        
-        # 3. 历史风控指标
+        # 夏普比率 (过去252天)
         returns = df['close'].pct_change().tail(252)
         sharpe = (returns.mean() * 252 - 0.02) / (returns.std() * np.sqrt(252)) if returns.std() != 0 else 0
-        mdd = ((df['close'] / df['close'].cummax()) - 1).min()
-        
-        return df, round(sharpe, 2), round(mdd * 100, 2)
+        return df, round(sharpe, 2)
 
     @staticmethod
-    def analyze_signal(file_path):
+    def analyze(file_path):
         try:
             df = pd.read_csv(file_path)
-            df.columns = [c.lower().strip() for c in df.columns]
-            if len(df) < 60: return None
-            
-            df, sharpe, mdd = QuantEngine.calculate_metrics(df)
+            if len(df) < 30: return None
+            df, sharpe = StrategyV10.get_metrics(df)
             last = df.iloc[-1]
             
-            # --- 核心信号逻辑：趋势过滤 + 回撤修复 ---
+            # --- 信号评估逻辑 ---
             peak_20 = df['close'].tail(20).max()
-            dd_20 = (last['close'] - peak_20) / peak_20
-            avg_amt = df['amount'].tail(5).mean() / 1e6
-            
+            dd = (last['close'] - peak_20) / peak_20
             score = 0
-            # A. 趋势保护：MA20斜率不能明显向下
-            if last['slope_20'] > -0.001:
-                # B. 均线金叉与回撤空间
-                if last['close'] > last['ma5'] and dd_20 < -0.05:
-                    score += 2
-                    if last['close'] > last['ma20']: score += 1
-                    if last['amount'] > df['amount'].tail(10).mean() * 1.1: score += 1
             
-            if score >= 3 and sharpe > 0.5 and avg_amt > 50:
-                # --- 实盘执行计算 ---
-                # 考虑滑点的拟买入价
-                est_entry = last['close'] * (1 + CONFIG['FEE_SLIPPAGE'])
-                # 动态止损：2.2倍ATR (稍微放宽以防早盘诱空)
-                stop_price = est_entry - (2.2 * last['atr'])
-                # 动态止盈：3.5倍ATR
-                target_price = est_entry + (3.5 * last['atr'])
-                
-                # 风险平摊仓位计算
-                risk_amt = CONFIG['CAPITAL'] * CONFIG['RISK_PER_TRADE']
-                shares = risk_amt / (est_entry - stop_price)
-                # 结合单只持仓上限限制
-                max_val = CONFIG['CAPITAL'] * (CONFIG['TOTAL_POS_LIMIT'] / CONFIG['MAX_HOLDINGS'])
-                final_shares = int(min(shares, max_val / est_entry) // 100 * 100)
+            # 1. 入场门槛：站上5日线 + 满足最小回撤
+            if last['close'] > last['ma5'] and dd <= CONFIG['MIN_DD']:
+                score = 1
+                if last['close'] > last['ma10']: score += 1
+                # 趋势斜率放宽：只要20日均线不处于极速下跌状态(斜率>-0.003)
+                slope_20 = (last['ma20'] - df['ma20'].iloc[-5]) / 5
+                if slope_20 > -0.003: score += 1
+                # 量能：比过去5日均量稍大
+                if last['amount'] > df['amount'].tail(5).mean(): score += 1
+            
+            # 2. 过滤：得分>=3 且 夏普>0.2
+            if score >= 3 and sharpe >= CONFIG['MIN_SHARPE']:
+                # 动态风控
+                stop_p = last['close'] - (2 * last['atr'])
+                risk_amt = CONFIG['TOTAL_CAPITAL'] * CONFIG['RISK_PER_TRADE']
+                shares = int(risk_amt / max(last['close'] - stop_p, 0.01) // 100 * 100)
                 
                 return {
-                    'code': os.path.basename(file_path)[:6],
-                    'score': score, 'price': round(est_entry, 3),
-                    'stop': round(stop_price, 3), 'target': round(target_price, 3),
-                    'shares': final_shares, 'sharpe': sharpe, 'mdd': mdd,
-                    'amt': round(avg_amt, 1)
+                    'code': "".join(filter(str.isdigit, os.path.basename(file_path))).zfill(6),
+                    'score': score, 'price': round(last['close'], 3),
+                    'stop': round(stop_p, 3), 'shares': shares,
+                    'sharpe': sharpe, 'dd': round(dd * 100, 1)
                 }
         except: return None
 
-def execute():
+# --- 3. 执行模块 ---
+def main():
+    db = load_fund_db()
     results = []
     files = glob.glob(os.path.join(CONFIG['DATA_DIR'], "*.csv"))
+    
     for f in files:
-        res = QuantEngine.analyze_signal(f)
-        if res and res['shares'] > 0: results.append(res)
+        res = StrategyV10.analyze(f)
+        if res:
+            info = db.get(res['code'], {'name': '未匹配', 'index': '未知'})
+            res.update(info)
+            results.append(res)
     
-    # 组合优选：评分 > 夏普 > 换手活性
-    results.sort(key=lambda x: (x['score'], x['sharpe'], x['amt']), reverse=True)
-    selection = results[:CONFIG['MAX_HOLDINGS']]
+    # 排序：高分 > 高夏普
+    results.sort(key=lambda x: (x['score'], x['sharpe']), reverse=True)
     
-    # 生成 Markdown 报表
     with open(CONFIG['REPORT_FILE'], "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 实盘组合看板 V9.1\n\n")
-        f.write(f"📅 更新时间: `{datetime.now().strftime('%Y-%m-%d %H:%M')}` (UTC+8)\n")
-        f.write(f"🛡️ 风控：单笔风险 {CONFIG['RISK_PER_TRADE']*100}% | 最大持仓 {CONFIG['MAX_HOLDINGS']} 只\n\n")
+        f.write(f"# 🛰️ 中等强度实盘看板 V10\n\n")
+        f.write(f"最后更新: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n")
+        f.write(f"🛡️ 风控配置: 单笔风险 {CONFIG['RISK_PER_TRADE']*100}% | 准入夏普 > {CONFIG['MIN_SHARPE']}\n\n")
         
-        if not selection:
-            f.write("> 😴 今日暂无高胜率信号，建议空仓观察。")
+        if results:
+            f.write("| 代码 | 简称 | 追踪指数/行业 | 得分 | 现价 | 建议买入 | 止损参考 | 20日回撤 |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            for s in results[:CONFIG['MAX_HOLDINGS'] * 2]:
+                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {'🔥'*s['score']} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} | {s['dd']}% |\n")
         else:
-            f.write("| 代码 | 评分 | 建议股数 | 预估买入价 | 止损参考 | 目标止盈 | 夏普比 |\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- |\n")
-            for s in selection:
-                f.write(f"| {s['code']} | {'🔥'*s['score']} | **{s['shares']}** | {s['price']} | {s['stop']} | {s['target']} | {s['sharpe']} |\n")
+            f.write("> 😴 当前市场信号强度一般，建议继续观察。")
 
 if __name__ == "__main__":
-    execute()
+    main()
