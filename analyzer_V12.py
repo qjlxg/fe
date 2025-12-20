@@ -8,7 +8,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # --- 核心配置 ---
-TOTAL_CAPITAL = 100000       
+TOTAL_CAPITAL = 10000       
 DATA_DIR = 'fund_data'
 REPORT_FILE = 'README.md'
 MIN_SCORE_SHOW = 3  # 严格执行：只显示 3 分及以上精英信号
