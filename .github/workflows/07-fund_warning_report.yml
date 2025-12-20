@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - 'analyzer_V9.py'
-      - '*.csv'  # 包含沪深列表更新时运行
+      - '.github/workflows/07-fund_warning_report.yml'  
   schedule:
     - cron: '50 7 * * *' # 北京时间 15:50
   workflow_dispatch: 
