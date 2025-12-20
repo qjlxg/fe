@@ -47,6 +47,6 @@ jobs:
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action Bot"
         # 只有在文件有变动时才提交，防止报错
-        git add backtest_results.csv
+        git add backtest_results_filtered.csv
         git commit -m "自动更新回测排名报告 [skip ci]" || echo "无变动需要提交"
         git push
