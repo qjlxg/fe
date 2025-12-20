@@ -1,61 +1,38 @@
-name: 🚀 天枢 V10.2 自动化实战闭环
+name: 🚀 天枢本地增强版
 
 on:
-  # 触发机制 1：代码或配置变动时自动运行
   push:
     paths:
-      - 'analyzer_V9.py'          # 脚本变动
-      - '.github/workflows/**'    # YML变动
-      - 'portfolio.csv'           # 当你手动更新持仓账本时也运行
-
-  # 触发机制 2：定时任务（北京时间每天 15:45）
+      - 'analyzer_V9.py'
+      - '*.csv'  # 包含沪深列表更新时运行
   schedule:
-    - cron: '45 7 * * *'         # UTC 07:45 = CST 15:45
-
-  # 触发机制 3：支持手动点击按钮运行
+    - cron: '50 7 * * *' # 北京时间 15:50
   workflow_dispatch: 
 
 jobs:
-  build_and_analyze:
+  run_analysis:
     runs-on: ubuntu-latest
     permissions:
-      contents: write            # 赋予写入权限，以便将结果推送回目录
-
+      contents: write
     steps:
-      - name: 📥 1. 拉取仓库代码
+      - name: 📥 1. 拉取仓库
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: 🐍 2. 设置 Python 环境
+      - name: 🐍 2. Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: 🛠️ 3. 安装必备金融库
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy akshare
+      - name: 🛠️ 3. 依赖
+        run: pip install pandas numpy
 
-      - name: 📈 4. 执行天枢核心分析
+      - name: 📈 4. 执行本地化分析
         run: python analyzer_V9.py
 
-      - name: 💾 5. 将分析结果推送至目录
+      - name: 💾 5. 推送结果
         run: |
           git config --global user.name "Sky-Pivot-Bot"
-          git config --global user.email "actions@github.com"
-          
-          # 将变动的文件加入暂存区
-          git add README.md portfolio.csv signal_performance_tracker.csv || true
-          
-          # 检查是否有文件更新，无更新则退出
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "📢 今日看板无变动，跳过推送。"
-            exit 0
-          fi
-          
-          git commit -m "📊 [自动分析] 更新看板与实战记录: $(date +'%Y-%m-%d %H:%M')"
-          
-          # 强制拉取远程变动防止推送冲突
-          git pull --rebase origin main
-          git push origin main
+          git config --global user.email "bot@quant.com"
+          git add README.md signal_performance_tracker.csv
+          git commit -m "📊 终极本地看板更新: $(date +'%Y-%m-%d %H:%M')" || echo "No changes"
+          git push
