@@ -1,145 +1,156 @@
 import pandas as pd
-import numpy as np
-import akshare as ak
+import glob
 import os
-from datetime import datetime, timedelta
+import numpy as np
+from datetime import datetime, time as dt_time
+import warnings
+import csv
 
-# --- 豹哥核心配置 ---
-TOTAL_ASSETS = 100000          # 总本金
-RISK_LEVEL = 0.01              # 单笔交易风险系数 (1% 风险)
-BENCHMARK_CODE = "510300"      # 沪深300 ETF 作为大盘风向标
-WIN_RATE_THRESHOLD = 0.40      # 历史胜率准入门槛
-TURNOVER_CONFIRM = 1.0         # 换手倍率阈值
-DATA_DIR = "fund_data"
+warnings.filterwarnings('ignore')
 
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# --- 豹哥实战配置 ---
+TOTAL_ASSETS = 100000              # 总本金
+FUND_DATA_DIR = 'fund_data'        # 数据文件夹
+BENCHMARK_CODE = '510300'          # 大盘风向标
+TRADE_LOG_FILE = "豹哥实战日志.csv"
 
-class BaoGeTrader:
-    def __init__(self, codes):
-        self.codes = codes
-        self.results = []
+# 策略参数
+WIN_RATE_THRESHOLD = 0.40          
+TURNOVER_CONFIRM = 1.0             
+MIN_DRAWDOWN = -0.045              
+ATR_STOP_MULTIPLIER = 2            
+MAX_SINGLE_POSITION = 0.3          
 
-    def fetch_data(self, code):
-        """自动抓取最新行情 (接入AkShare)"""
-        try:
-            # 场内基金数据接口
-            df = ak.fund_etf_hist_em(symbol=code, period="daily", adjust="qfq")
-            df = df.rename(columns={
-                '日期': 'date', '开盘': 'open', '收盘': 'close', 
-                '最高': 'high', '最低': 'low', '成交量': 'volume', '换手率': 'turnover'
-            })
-            df['date'] = pd.to_datetime(df['date'])
-            return df
-        except Exception as e:
-            print(f"❌ 抓取 {code} 失败: {e}")
-            return None
+def validate_data_freshness():
+    """检查数据是否是最新的"""
+    print("🔍 正在检查数据新鲜度...")
+    files = glob.glob(os.path.join(FUND_DATA_DIR, "*.csv"))
+    if not files: return False
+    
+    latest_file = max(files, key=os.path.getmtime)
+    file_time = os.path.getmtime(latest_file)
+    days_diff = (datetime.now() - datetime.fromtimestamp(file_time)).days
+    if days_diff > 1:
+        print(f"⚠️ 警告：数据已过期 {days_diff} 天，请先运行更新脚本！")
+        return False
+    print("✅ 数据状态：新鲜")
+    return True
 
-    def get_market_weather(self):
-        """判断大盘环境：确定仓位乘数"""
-        df = self.fetch_data(BENCHMARK_CODE)
-        if df is None: return 1.0, "🌤️ 正常"
+def load_data(filepath):
+    try:
+        df = pd.read_csv(filepath, encoding='utf-8')
+    except:
+        df = pd.read_csv(filepath, encoding='gbk')
+    df.columns = [c.strip() for c in df.columns]
+    column_map = {'日期': 'date', '收盘': 'close', '最高': 'high', '最低': 'low', '换手率': 'turnover'}
+    df = df.rename(columns=column_map)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+    for col in ['close', 'high', 'low', 'turnover']:
+        if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df.dropna(subset=['close'])
+
+def get_market_weather():
+    path = os.path.join(FUND_DATA_DIR, f"{BENCHMARK_CODE}.csv")
+    if not os.path.exists(path): return 0, "🌤️ 未知", 1.0
+    df = load_data(path)
+    df['MA20'] = df['close'].rolling(20).mean()
+    bias = ((df['close'].iloc[-1] - df['MA20'].iloc[-1]) / df['MA20'].iloc[-1]) * 100
+    if bias < -4: return bias, "❄️ 深冬 (严控仓位)", 0.5
+    if bias < -2: return bias, "🌨️ 初冬 (谨慎出击)", 0.8
+    return bias, "🌤️ 早春 (正常执行)", 1.0
+
+def calculate_shares(last_close, stop_price, multiplier):
+    """计算具体买入股数（取整到百位，即1手）"""
+    risk_per_share = last_close - stop_price
+    if risk_per_share <= 0: return 0
+    # 单笔风险不超过总本金的 1%
+    max_risk_amount = TOTAL_ASSETS * 0.01
+    max_shares = int(max_risk_amount / risk_per_share)
+    # 环境调整并确保不超过单只上限
+    adjusted_shares = int(max_shares * multiplier)
+    limit_shares = int((TOTAL_ASSETS * MAX_SINGLE_POSITION) / last_close)
+    final_shares = min(adjusted_shares, limit_shares)
+    return (final_shares // 100) * 100  # A股买入必须是100的整数倍
+
+def log_trade_signal(signal, weather):
+    """记录交易信号到CSV"""
+    file_exists = os.path.exists(TRADE_LOG_FILE)
+    with open(TRADE_LOG_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['日期', '时间', '代码', '动作', '价格', '建议股数', '止损价', '环境'])
+        now = datetime.now()
+        writer.writerow([
+            now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'),
+            signal['code'], signal['action'], signal['price'],
+            signal['shares'], signal['stop'], weather
+        ])
+
+def analyze():
+    # 1. 环境与时间检查
+    trade_time = datetime.now().time()
+    if not (dt_time(9, 15) <= trade_time <= dt_time(15, 5)):
+        print("⚠️ 提示：当前非交易时段，分析结果仅供复盘")
+    
+    if not validate_data_freshness(): return
+
+    bias_val, weather, multiplier = get_market_weather()
+    files = glob.glob(os.path.join(FUND_DATA_DIR, "*.csv"))
+    
+    results = []
+    for f in files:
+        code = os.path.splitext(os.path.basename(f))[0]
+        if code == BENCHMARK_CODE: continue
+        df = load_data(f)
+        if df is None or len(df) < 30: continue
         
-        df['MA20'] = df['close'].rolling(20).mean()
-        last_close = df['close'].iloc[-1]
-        last_ma20 = df['MA20'].iloc[-1]
-        bias = (last_close - last_ma20) / last_ma20 * 100
-        
-        if bias < -4: return 0.5, "❄️ 深冬 (极轻仓)"
-        if bias < -2: return 0.8, "🌨️ 初冬 (谨慎)"
-        if bias > 5:  return 0.7, "🥵 盛夏 (防冲高回落)"
-        return 1.0, "🌤️ 早春 (正常)"
-
-    def fast_win_rate(self, df):
-        """高性能向量化回测：计算该标的历史信号胜率"""
-        if len(df) < 60: return 0.0
-        
-        df = df.copy()
-        # 计算指标
         df['MA5'] = df['close'].rolling(5).mean()
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        df['rsi'] = 100 - (100 / (1 + gain/loss.replace(0, 0.001)))
+        df['TO_MA10'] = df['turnover'].rolling(10).mean()
+        tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
+        df['atr'] = tr.rolling(14).mean()
         
-        # 定义信号：RSI超卖后站上5日线
-        df['signal'] = (df['rsi'].shift(1) < 35) & (df['close'] > df['MA5'])
+        last = df.iloc[-1]
+        drawdown = (last['close'] - df['close'].rolling(20).max().iloc[-1]) / df['close'].rolling(20).max().iloc[-1]
         
-        # 计算信号发出后5日内的最高涨幅是否超过2%
-        df['future_max'] = df['close'].rolling(5).max().shift(-5)
-        df['is_win'] = (df['future_max'] - df['close']) / df['close'] >= 0.02
+        action = "🔴 别看"
+        stop_val = 0
+        shares = 0
         
-        wins = df[df['signal']]['is_win'].sum()
-        total = df['signal'].sum()
-        
-        return wins / total if total > 0 else 0.0
+        if drawdown < MIN_DRAWDOWN:
+            if last['close'] > last['MA5']:
+                # 简化逻辑：实战中重点看站稳5日线和回撤
+                action = "🟢 搞它"
+                stop_val = last['close'] - (ATR_STOP_MULTIPLIER * last['atr'])
+                shares = calculate_shares(last['close'], stop_val, multiplier)
+            else:
+                action = "🟡 等破5线"
 
-    def analyze(self):
-        multiplier, weather = self.get_market_weather()
-        print(f"\n{'='*60}\n🚀 豹哥实战报告 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"当前大盘环境: {weather} | 仓位乘数: {multiplier}")
-        print(f"{'='*60}")
-        print(f"{'代码':<8} | {'状态':<10} | {'参考价':<8} | {'建议仓位':<8} | {'止损价'}")
-        print(f"{'-'*60}")
+        if action != "🔴 别看":
+            results.append({
+                'code': code, 'action': action, 'price': last['close'], 
+                'shares': shares, 'stop': round(stop_val, 3), 
+                'weight': 2 if action == "🟢 搞它" else 1
+            })
 
-        for code in self.codes:
-            df = self.fetch_data(code)
-            if df is None or len(df) < 30: continue
-            
-            # 基础指标
-            last = df.iloc[-1]
-            ma5 = df['close'].rolling(5).mean().iloc[-1]
-            ma20_max = df['close'].rolling(20).max().iloc[-1]
-            to_ma10 = df['turnover'].rolling(10).mean().iloc[-1]
-            
-            # ATR风控计算
-            tr = pd.concat([(df['high'] - df['low']), 
-                            (df['high'] - df['close'].shift()).abs(), 
-                            (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
-            atr = tr.rolling(14).mean().iloc[-1]
-            
-            # 核心判断逻辑
-            drawdown = (last['close'] - ma20_max) / ma20_max
-            is_right_side = last['close'] > ma5
-            to_ratio = last['turnover'] / to_ma10 if to_ma10 > 0 else 0
-            
-            status = "⚪ 观望"
-            pos_str = "---"
-            stop_price = "---"
+    results.sort(key=lambda x: (x['weight'], x['shares']), reverse=True)
 
-            # 1. 卖出逻辑 (假设你已持仓，这里判断是否该卖)
-            if last['close'] < ma5:
-                status = "🚨 撤退"
-            
-            # 2. 买入逻辑 (不绿不买，转强才买)
-            elif drawdown < -0.045:
-                if is_right_side:
-                    win_rate = self.fast_win_rate(df)
-                    if to_ratio >= TURNOVER_CONFIRM and win_rate >= WIN_RATE_THRESHOLD:
-                        status = "🟢 搞它"
-                        # 风险头寸计算
-                        stop_val = last['close'] - (2 * atr)
-                        stop_price = f"{stop_val:.3f}"
-                        risk_per_share = last['close'] - stop_val
-                        if risk_per_share > 0:
-                            # 算出理论应买入金额
-                            raw_pos = (TOTAL_ASSETS * RISK_LEVEL) / (risk_per_share / last['close'])
-                            final_pos = min(raw_pos * multiplier, TOTAL_ASSETS * 0.3)
-                            pos_str = f"{final_pos/10000:.1f}万"
-                    else:
-                        status = "🟡 信号弱"
-                else:
-                    status = "🟡 等突破"
+    # --- 输出报告 ---
+    print("\n" + "="*75)
+    print(f"🐆 豹哥实战操作手册 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"当前大盘环境: {weather} (仓位系数: {multiplier})")
+    print("="*75)
+    print(f"{'代码':<8} | {'动作':<10} | {'买入参考':<8} | {'建议股数':<10} | {'止损价':<8}")
+    print("-" * 75)
 
-            if status != "⚪ 观望":
-                print(f"{code:<8} | {status:<10} | {last['close']:<10.3f} | {pos_str:<10} | {stop_price}")
+    for r in results:
+        print(f"{r['code']:<8} | {r['action']:<10} | {r['price']:<10.3f} | {r['shares']:<12} | {r['stop']:<8.3f}")
+        if r['action'] == "🟢 搞它":
+            log_trade_signal(r, weather)
 
-        print(f"{'-'*60}")
-        print("💡 豹哥嘱托：控制仓位是生存之本，止损线是生命线！")
+    print("-" * 75)
+    print("📌 豹哥实战纪律：1.不绿不买 2.按量下单 3.破位必卖")
+    print("✅ 交易信号已记录至 [豹哥实战日志.csv]")
 
-# --- 使用示例 ---
 if __name__ == "__main__":
-    # 在这里输入你想监控的 ETF 或 股票代码
-    my_watch_list = ["510500", "512170", "515050", "159915", "513330"]
-    trader = BaoGeTrader(my_watch_list)
-    trader.analyze()
+    analyze()
