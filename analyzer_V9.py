@@ -29,25 +29,26 @@ def load_fund_db():
         df = pd.read_excel(EXCEL_DB, dtype=str, engine='openpyxl')
         df.columns = [str(c).strip() for c in df.columns]
         
-        # 定位列名
+        # 定位列名（更宽松匹配）
         c_code = next((c for c in df.columns if '代码' in c), None)
-        c_name = next((c for c in df.columns if '简称' in c), None)
-        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '拟合', '标的'])), None)
+        c_name = next((c for c in df.columns if '简称' in c or '名称' in c or '名字' in c), None)
+        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '拟合', '标的', '跟踪', '追踪'])), None)
 
         if c_code and c_name:
             for _, row in df.iterrows():
-                # 处理 Excel 代码：先转字符串，去掉可能存在的 '.0'，再补零
+                # 处理 Excel 代码：转字符串，去掉 .0，提取数字，补足6位
                 raw_code = str(row[c_code]).strip().split('.')[0]
                 clean_code = "".join(filter(str.isdigit, raw_code)).zfill(6)
                 
                 if clean_code:
                     fund_db[clean_code] = {
-                        'name': str(row[c_name]).strip(),
+                        'name': str(row[c_name]).strip() if not pd.isna(row[c_name]) else "未知基金",
                         'index': str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "行业/宽基指数"
                     }
             print(f"✅ 匹配库加载完成，共 {len(fund_db)} 条记录")
         else:
             print(f"❌ Excel 列名不匹配，当前列名: {list(df.columns)}")
+            print(f"   代码列: {c_code}, 简称列: {c_name}")
     except Exception as e:
         print(f"❌ 解析 Excel 失败: {e}")
     return fund_db
@@ -103,19 +104,30 @@ def execute():
         code = "".join(filter(str.isdigit, fname)).zfill(6)
         
         try:
-            res = analyze_signal(pd.read_csv(f))
+            df = pd.read_csv(f)
+            res = analyze_signal(df)
             if res:
-                # 即使没有在 Excel 匹配到，也赋予默认名称防止结果消失
                 info = db.get(code)
                 if info:
-                    res.update({'code': code, 'name': info['name'], 'index': info['index']})
+                    # 优先使用 Excel 中匹配到的简称和指数
+                    name_display = info['name']
+                    index_display = info['index']
                 else:
-                    res.update({'code': code, 'name': f"未匹配({code})", 'index': "需检查Excel"})
+                    # 未匹配时才显示“未匹配(代码)”
+                    name_display = f"未匹配({code})"
+                    index_display = "需检查Excel"
+
+                res.update({
+                    'code': code,
+                    'name': name_display,        # 这里是关键：显示匹配到的简称
+                    'index': index_display
+                })
                 results.append(res)
         except Exception as e:
+            print(f"⚠️ 处理 {code} 失败: {e}")
             continue
 
-    # 排序：得分从高到低
+    # 排序：得分从高到低，回撤越深越靠前
     results.sort(key=lambda x: (x['score'], -x['dd']), reverse=True)
 
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
@@ -123,7 +135,8 @@ def execute():
         f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 过滤条件: `得分 ≥ 3`\n\n")
         
         if results:
-            f.write("| 代码 | 简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损参考 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            f.write("| 代码 | 简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损参考 |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
             for s in results:
                 icon = "🔥" * s['score']
                 f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {icon} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
