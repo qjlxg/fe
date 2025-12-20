@@ -1,19 +1,16 @@
-name: 🚀 天看板
-
+name: 🚀 V10
 on:
   schedule:
-    # 北京时间每天 15:40 自动运行
-    - cron: '40 7 * * *'
-  workflow_dispatch: # 支持手动运行
+    - cron: '45 7 * * *' # 北京时间 15:45
+  workflow_dispatch: 
 
 jobs:
-  trade_bot:
+  run_bot:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须赋予写入权限
-
+      contents: write
     steps:
-      - name: 📥 拉取最新代码
+      - name: 📥 拉取代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -23,25 +20,21 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 🛠️ 安装依赖
-        run: pip install pandas numpy
+      - name: 🛠️ 安装增强依赖
+        run: |
+          pip install pandas numpy akshare
 
-      - name: 📈 运行天枢分析
+      - name: 📈 运行 V10 核心系统
         run: python analyzer_V9.py
 
-      - name: 💾 同步结果至仓库目录
+      - name: 💾 同步分析结果
         run: |
           git config --global user.name "Sky-Pivot-Bot"
           git config --global user.email "bot@quant.com"
-          
-          # 添加所有结果文件
-          git add README.md portfolio.csv signal_performance_tracker.csv || true
-          
+          git add README.md signal_performance_tracker.csv portfolio.csv
           if [ -z "$(git status --porcelain)" ]; then
-            echo "无变化，跳过推送"
+            echo "No change"
             exit 0
           fi
-          
-          git commit -m "📊 更新看板与信号跟踪: $(date +'%Y-%m-%d %H:%M')"
-          git pull --rebase origin main
+          git commit -m "📊 V10.0 智能看板更新: $(date +'%Y-%m-%d %H:%M')"
           git push origin main
