@@ -8,10 +8,11 @@ warnings.filterwarnings('ignore')
 # --- 核心配置 ---
 TOTAL_CAPITAL = 100000       # 总资金
 DATA_DIR = 'fund_data'       # 数据目录
-REPORT_FILE = 'README.md'    # 输出报告
+REPORT_FILE = 'README.md'    # 正式报告
+DEBUG_FILE = 'DEBUG_REPORT.md' # 调试报告
 EXCEL_DB = 'ETF列表.xlsx'    # ETF数据库
-# 策略参数（针对ETF优化）
-MIN_SCORE_SHOW = 2           # 最低显示分数（原为3，适当降低以捕捉机会）
+# 策略参数
+MIN_SCORE_SHOW = 2           # 最低显示分数
 MA_SHORT = 5                 # 短期均线
 MA_LONG = 10                 # 长期均线
 VOL_MA = 5                   # 成交量均线
@@ -25,11 +26,8 @@ def load_fund_db():
         print(f"❌ 找不到数据库: {EXCEL_DB}")
         return fund_db
     try:
-        # 强制以字符串读取，避免代码变成浮点数
         df = pd.read_excel(EXCEL_DB, dtype=str, engine='openpyxl')
         df.columns = [str(c).strip() for c in df.columns]
-        
-        # 智能匹配列名（支持多种变体）
         c_code = next((c for c in df.columns if '代码' in c), None)
         c_name = next((c for c in df.columns if '简称' in c or '名称' in c), None)
         c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '标的', '跟踪', '追踪', '行业'])), None)
@@ -39,7 +37,6 @@ def load_fund_db():
         for _, row in df.iterrows():
             raw_code = str(row[c_code]).strip()
             clean_code = "".join(filter(str.isdigit, raw_code)).zfill(6)
-            
             if clean_code and len(clean_code) == 6:
                 fund_db[clean_code] = {
                     'name': str(row[c_name]).strip() if not pd.isna(row[c_name]) else "未知基金",
@@ -49,94 +46,116 @@ def load_fund_db():
     except Exception as e:
         print(f"❌ 解析 Excel 失败: {e}")
     return fund_db
-# --- 3. ETF策略引擎（重构版） ---
-def analyze_etf_signal(df):
+# --- 3. ETF策略引擎（带调试版） ---
+def analyze_etf_signal_debug(df, code, fund_db):
     """
-    针对ETF数据优化的策略：
-    1. 趋势：收盘价 > MA5 且 MA5 > MA10 (多头排列)
-    2. 量能：今日成交量 > 5日均量 (放量)
-    3. 波动：振幅不过大（过滤异常）
+    带调试信息的策略分析
     """
-    if len(df) < 30: return None
+    if len(df) < 30: 
+        return None, f"数据不足(仅{len(df)}行)"
     
-    # 确保列名存在（直接使用CSV原始列名）
+    # 确保列名存在
     required_cols = ['日期', '收盘', '成交量', '振幅']
     if not all(col in df.columns for col in required_cols):
-        # 尝试兼容常见变体
-        col_map = {}
-        if '收盘' not in df.columns and '收盘价' in df.columns: col_map['收盘价'] = '收盘'
-        if '成交量' not in df.columns and '成交额' in df.columns: col_map['成交额'] = '成交量' # 注意：这里假设CSV里的成交量是股数，如果是成交额需调整逻辑
-        df.rename(columns=col_map, inplace=True)
-        if not all(col in df.columns for col in required_cols):
-            return None
+        return None, f"列名缺失: 需要{required_cols}, 实际有{list(df.columns)}"
+    
     # 数据清洗
     df['收盘'] = pd.to_numeric(df['收盘'], errors='coerce')
     df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce')
     df['振幅'] = pd.to_numeric(df['振幅'], errors='coerce')
     df.dropna(subset=['收盘', '成交量'], inplace=True)
     
-    if len(df) < 30: return None
+    if len(df) < 30: 
+        return None, "清洗后数据不足30行"
+        
     # 计算指标
     last = df.iloc[-1]
     ma5 = df['收盘'].rolling(MA_SHORT).mean().iloc[-1]
     ma10 = df['收盘'].rolling(MA_LONG).mean().iloc[-1]
     vol_ma5 = df['成交量'].rolling(VOL_MA).mean().iloc[-1]
-    
-    # 评分逻辑
-    score = 0
-    
-    # 1. 趋势分 (1分)
-    if last['收盘'] > ma5 and ma5 > ma10:
-        score += 1
-        
-    # 2. 量能分 (1分) - 放量上涨
-    if last['成交量'] > vol_ma5:
-        score += 1
-        
-    # 3. 强势分 (1分) - 创近期新高或接近新高 (替代原逻辑的回撤条件)
-    # 这里改为：20日最高点回撤小于 2% (即非常接近20日高点)
     peak_20 = df['收盘'].rolling(20).max().iloc[-1]
-    dd = (last['收盘'] - peak_20) / peak_20
-    if dd > -0.02: # 距离20日高点回撤不超过2%
+    
+    # 详细指标
+    price = last['收盘']
+    vol = last['成交量']
+    dd = (price - peak_20) / peak_20 if peak_20 != 0 else 0
+    
+    # 评分逻辑分解
+    score = 0
+    reasons = []
+    fail_reasons = []
+    
+    # 条件1: 趋势 (1分)
+    cond1 = (price > ma5) and (ma5 > ma10)
+    if cond1:
         score += 1
-    # 如果满足最低分数
+        reasons.append(f"✅ 趋势多头: 价格{price:.3f} > MA5{ma5:.3f} > MA10{ma10:.3f}")
+    else:
+        fail_reasons.append(f"❌ 趋势不符: 价格{price:.3f}, MA5{ma5:.3f}, MA10{ma10:.3f}")
+        
+    # 条件2: 量能 (1分)
+    cond2 = vol > vol_ma5
+    if cond2:
+        score += 1
+        reasons.append(f"✅ 放量: 成交量{vol:.0f} > 均量{vol_ma5:.0f}")
+    else:
+        fail_reasons.append(f"❌ 缩量: 成交量{vol:.0f} <= 均量{vol_ma5:.0f}")
+        
+    # 条件3: 强势 (1分)
+    cond3 = dd > -0.02
+    if cond3:
+        score += 1
+        reasons.append(f"✅ 接近高点: 回撤{dd*100:.2f}% > -2%")
+    else:
+        fail_reasons.append(f"❌ 回撤过大: 回撤{dd*100:.2f}% <= -2%")
+    
+    # 获取基金名称
+    info = fund_db.get(code)
+    name = info['name'] if info else f"未匹配({code})"
+    
+    # 组装调试信息
+    debug_info = {
+        'code': code,
+        'name': name,
+        'score': score,
+        'price': price,
+        'reasons': reasons,
+        'fail_reasons': fail_reasons,
+        'raw_data': {
+            'price': price, 'ma5': ma5, 'ma10': ma10, 
+            'vol': vol, 'vol_ma5': vol_ma5, 'dd': dd*100
+        }
+    }
+    
     if score >= MIN_SCORE_SHOW:
-        # 资金管理与风控（针对ETF优化）
-        # 假设止损为当前价的 1% (ETF波动小，止损设窄一点)
-        # 或者固定金额止损
-        risk_per_share = last['收盘'] * 0.01  # 每股风险1%
-        
-        # 单次最大风险资金 (总资金的 2%)
+        # 计算买入股数
+        risk_per_share = price * 0.01
         max_risk_capital = TOTAL_CAPITAL * 0.02
-        
-        # 计算可买股数 (必须是100的倍数)
-        if risk_per_share > 0:
-            shares = int(max_risk_capital / risk_per_share)
-            # 向下取整到100的倍数
-            shares = (shares // 100) * 100
-        else:
-            shares = 0
-            
-        if shares < 100: shares = 100 # 最少买100股
-        
-        stop_price = last['收盘'] - risk_per_share
+        shares = int(max_risk_capital / risk_per_share)
+        shares = (shares // 100) * 100
+        if shares < 100: shares = 100
+        stop_price = price - risk_per_share
         
         return {
-            'score': score, 
-            'price': last['收盘'], 
-            'stop': stop_price, 
-            'shares': shares, 
-            'dd': dd * 100, # 记录距离20日高点的幅度
-            'vol_ratio': last['成交量'] / vol_ma5 if vol_ma5 > 0 else 1 # 量比
-        }
-    return None
+            'code': code,
+            'name': name,
+            'index': info['index'] if info else "未知",
+            'score': score,
+            'price': price,
+            'shares': shares,
+            'stop': stop_price,
+            'dd': dd * 100,
+            'vol_ratio': vol / vol_ma5 if vol_ma5 > 0 else 1
+        }, debug_info
+    else:
+        return None, debug_info
 # --- 4. 执行引擎 ---
 def execute():
     bj_now = get_beijing_time()
     db = load_fund_db()
     results = []
+    debug_logs = []
     
-    # 检查数据目录
     if not os.path.exists(DATA_DIR):
         print(f"❌ 数据目录不存在: {DATA_DIR}")
         return
@@ -144,64 +163,77 @@ def execute():
     if not files:
         print(f"❌ {DATA_DIR} 目录下没有找到CSV文件")
         return
-    print(f"🔍 开始扫描 {len(files)} 个ETF数据文件...")
+    
+    print(f"🔍 开始扫描 {len(files)} 个ETF数据文件 (调试模式)...")
     
     for f in files:
         fname = os.path.splitext(os.path.basename(f))[0]
         code = "".join(filter(str.isdigit, fname)).zfill(6)
         
         try:
-            # 读取CSV，指定分隔符为制表符或空格（根据您提供的数据格式）
-            # 您的数据看起来是用Tab分隔的，pandas默认会自动处理
-            df = pd.read_csv(f, sep='\s+') # \s+ 匹配空格或Tab
+            df = pd.read_csv(f, sep='\s+')
+            # 调用带调试的分析函数
+            res, debug_info = analyze_etf_signal_debug(df, code, db)
             
-            # 检查列名并提示（仅第一次）
-            # print(f"列名: {list(df.columns)}")
-            
-            res = analyze_etf_signal(df)
             if res:
-                info = db.get(code)
-                if info:
-                    name_display = info['name']
-                    index_display = info['index']
-                else:
-                    name_display = f"未匹配({code})"
-                    index_display = "需检查Excel"
-                res.update({
-                    'code': code,
-                    'name': name_display,
-                    'index': index_display
-                })
                 results.append(res)
+            
+            # 记录所有标的的调试信息（只记录前20个，避免日志太长）
+            if len(debug_logs) < 20:
+                debug_logs.append(debug_info)
+                
         except Exception as e:
             print(f"⚠️ 处理 {code} 失败: {e}")
             continue
-    # 排序：得分高 -> 量比大 优先
+            
+    # 排序
     results.sort(key=lambda x: (x['score'], x['vol_ratio']), reverse=True)
-    # 生成报告
-    with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ ETF智能筛选看板 (V9-Fix)\\n\\n")
-        f.write(f"**更新时间**: `{bj_now.strftime('%Y-%m-%d %H:%M')}`\\n")
-        f.write(f"**筛选逻辑**: 趋势(MA5>MA10) + 放量 + 接近20日高点\\n")
-        f.write(f"**资金策略**: 总资金 {TOTAL_CAPITAL/10000}w, 单票风控2%\\n\\n")
-        
-        if results:
-            f.write("| 代码 | 简称 | 追踪指数 | 趋势得分 | 现价 | 建议买入 | 止损参考 | 备注 |\\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\\n")
-            for s in results:
-                # 生成评分图标
-                icon = "🔥" * s['score']
-                # 备注信息
-                note = ""
-                if s['dd'] > -1: note += "📈 接近高点 "
-                if s['vol_ratio'] > 1.5: note += "⚡ 放量明显 "
-                
-                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {icon} | {s['price']:.3f} | {s['shares']}份 | {s['stop']:.3f} | {note} |\\n")
-        else:
-            f.write("> 😴 当前市场暂无满足条件的ETF标的。\\n")
-            f.write("> 提示：请检查CSV数据是否完整（至少30行），或调整策略参数。\\n")
     
-    print(f"✨ 执行完毕！共筛选出 {len(results)} 个符合条件的标的。")
-    print(f"📄 报告已生成至: {os.path.abspath(REPORT_FILE)}")
+    # 1. 生成正式报告
+    with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
+        f.write(f"# 🛰️ ETF智能筛选看板 (V9-Debug)\\n\\n")
+        f.write(f"**更新时间**: `{bj_now.strftime('%Y-%m-%d %H:%M')}`\\n")
+        f.write(f"**筛选结果**: 共 {len(results)} 个标的\\n\\n")
+        if results:
+            f.write("| 代码 | 简称 | 趋势得分 | 现价 | 建议买入 | 止损参考 |\\n")
+            f.write("| --- | --- | --- | --- | --- | --- |\\n")
+            for s in results:
+                icon = "🔥" * s['score']
+                f.write(f"| {s['code']} | **{s['name']}** | {icon} | {s['price']:.3f} | {s['shares']}份 | {s['stop']:.3f} |\\n")
+        else:
+            f.write("> 😴 暂无符合条件的标的。\\n")
+            
+    # 2. 生成调试报告
+    with open(DEBUG_FILE, "w", encoding="utf_8_sig") as f:
+        f.write(f"# 🐛 调试分析报告\\n\\n")
+        f.write(f"**生成时间**: `{bj_now.strftime('%Y-%m-%d %H:%M')}`\\n")
+        f.write(f"**样本数量**: 前 {len(debug_logs)} 个标的详情\\n\\n")
+        
+        for item in debug_logs:
+            f.write(f"## {item['code']} - {item['name']}\\n")
+            f.write(f"**最终得分**: {item['score']}/{MIN_SCORE_SHOW} \\n")
+            f.write(f"**当前价格**: {item['raw_data']['price']:.3f}\\n\\n")
+            
+            if item['reasons']:
+                f.write("**✅ 通过条件:**  \\n")
+                for r in item['reasons']:
+                    f.write(f"- {r}  \\n")
+            else:
+                f.write("**✅ 通过条件:** 无\\n")
+                
+            if item['fail_reasons']:
+                f.write("**❌ 未通过条件:**  \\n")
+                for r in item['fail_reasons']:
+                    f.write(f"- {r}  \\n")
+            else:
+                f.write("**❌ 未通过条件:** 无\\n")
+                
+            f.write(f"**📊 原始数据:** MA5={item['raw_data']['ma5']:.3f}, MA10={item['raw_data']['ma10']:.3f}, Vol={item['raw_data']['vol']:.0f}, VolMA={item['raw_data']['vol_ma5']:.0f}, DD={item['raw_data']['dd']:.2f}%\\n")
+            f.write("---\\n\\n")
+            
+    print(f"✨ 执行完毕！")
+    print(f"📄 正式报告: {os.path.abspath(REPORT_FILE)}")
+    print(f"🐛 调试报告: {os.path.abspath(DEBUG_FILE)}")
+    print(f"💡 请查看 DEBUG_REPORT.md 分析评分细节！")
 if __name__ == "__main__":
     execute()
