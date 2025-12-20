@@ -1,29 +1,41 @@
-name: 🚀 本地增强版实盘看板
+name: 🚀 实盘绩效回溯版 V12
 
 on:
   push:
     paths:
-      - 'analyzer_V9.py'
+      - 'analyzer_V12.py'
   schedule:
-    - cron: '55 6 * * *' # UTC 6:55 = 北京时间 14:55
+    - cron: '55 6 * * *' # 北京时间 14:55 运行
   workflow_dispatch: 
 
 jobs:
   run_analysis:
     runs-on: ubuntu-latest
+    # 关键：必须给 Actions 写入权限，否则无法更新 signal_history.csv
+    permissions:
+      contents: write
+      
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: 📥 1. 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 🐍 2. 初始化 Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: 🛠️ 依赖安装
-        run: pip install pandas numpy
-      - name: 📈 执行实时分析
-        run: python analyzer_V9.py
-      - name: 💾 推送结果
+
+      - name: 🛠️ 3. 安装依赖
+        run: pip install pandas numpy openpyxl
+
+      - name: 📈 4. 执行多维分析与胜率追踪
+        # 确保这里的文件名和你最新的 Python 脚本名一致
+        run: python analyzer_V12.py
+
+      - name: 💾 5. 保存结果与历史账本
         run: |
           git config --global user.name "Quant-Bot"
           git config --global user.email "bot@quant.com"
-          git add README.md
-          git commit -m "📊 信号生成: $(date +'%Y-%m-%d %H:%M')" || echo "No changes"
+          # 关键：这里要把 csv 文件也加入追踪
+          git add README.md signal_history.csv
+          git commit -m "📊 绩效看板与历史数据更新: $(date +'%Y-%m-%d %H:%M')" || echo "No changes"
           git push
