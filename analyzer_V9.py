@@ -1,144 +1,132 @@
 import pandas as pd
+import numpy as np
 import glob
 import os
-import numpy as np
 from datetime import datetime, timedelta
-import warnings
 
-warnings.filterwarnings('ignore')
+# --- 1. 实盘与组合配置 ---
+CONFIG = {
+    'CAPITAL': 100000,        # 初始资金
+    'RISK_PER_TRADE': 0.01,   # 单笔交易风险系数 (1%)
+    'MAX_HOLDINGS': 2,        # 【新增】组合最大持仓数量：不超过2只
+    'TOTAL_POS_LIMIT': 0.6,   # 【新增】总仓位上限：总投入不超过资金的60%
+    'FEE_SLIPPAGE': 0.0005,   # 综合佣金与滑点预留 (万五)
+    'DATA_DIR': 'fund_data',
+    'MIN_SHARPE': 0.5,        # 历史性价比门槛
+    'MAX_DD_LIMIT': -20.0     # 历史回撤容忍度 (%)
+}
 
-# --- 核心配置 ---
-TOTAL_CAPITAL = 100000       
-DATA_DIR = 'fund_data'
-REPORT_FILE = 'README.md'
-MIN_SCORE_SHOW = 3  # 严格执行：只显示 3 分及以上精英信号
-EXCEL_DB = 'ETF列表.xlsx' 
-
-def get_beijing_time():
-    return datetime.utcnow() + timedelta(hours=8)
-
-# --- 1. 深度匹配引擎（适配你的Excel格式） ---
-def load_fund_db():
-    fund_db = {}
-    if not os.path.exists(EXCEL_DB):
-        print(f"❌ 找不到数据库: {EXCEL_DB}")
-        return fund_db
-
-    try:
-        # 强制以字符串读取，避免代码变成浮点数
-        df = pd.read_excel(EXCEL_DB, dtype=str, engine='openpyxl')
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        # 匹配“证券代码”和“证券简称”列（支持常见变体）
-        c_code = next((c for c in df.columns if '代码' in c), None)
-        c_name = next((c for c in df.columns if '简称' in c or '名称' in c), None)
-        # 可选：追踪指数列（如果以后加了这一列会自动识别）
-        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '标的', '跟踪', '追踪', '行业'])), None)
-
-        if not c_code or not c_name:
-            print(f"❌ Excel 列名无法识别，当前列: {list(df.columns)}")
-            return fund_db
-
-        for _, row in df.iterrows():
-            # 处理代码：提取数字，补足6位
-            raw_code = str(row[c_code]).strip()
-            clean_code = "".join(filter(str.isdigit, raw_code)).zfill(6)
-            
-            if clean_code and len(clean_code) == 6:
-                fund_db[clean_code] = {
-                    'name': str(row[c_name]).strip() if not pd.isna(row[c_name]) else "未知基金",
-                    'index': str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "需手动补充指数"
-                }
-
-        print(f"✅ 匹配库加载完成，共 {len(fund_db)} 条记录")
-    except Exception as e:
-        print(f"❌ 解析 Excel 失败: {e}")
-    return fund_db
-
-# --- 2. 策略逻辑（不变） ---
-def analyze_signal(df):
+# --- 2. 核心指标引擎 ---
+def calculate_metrics(df):
+    """计算精准的指标：ATR 与 历史风控"""
     if len(df) < 30: return None
     
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    mapping = {'日期':'date','收盘':'close','成交额':'amount','振幅':'vol','换手率':'turnover'}
-    df.rename(columns=mapping, inplace=True)
+    # 精准 TR 计算 (当前高低、当前高昨收、当前低昨收的极大值)
+    df['h_l'] = df['high'] - df['low']
+    df['h_pc'] = (df['high'] - df['close'].shift(1)).abs()
+    df['l_pc'] = (df['low'] - df['close'].shift(1)).abs()
+    df['tr'] = df[['h_l', 'h_pc', 'l_pc']].max(axis=1)
+    df['atr'] = df['tr'].rolling(14).mean()
     
-    for col in ['close','amount','vol']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    # 历史风险指标 (基于过去252个交易日)
+    hist = df.tail(252).copy()
+    returns = hist['close'].pct_change().dropna()
+    if len(returns) < 120: return None
     
-    last = df.iloc[-1]
-    ma5 = df['close'].rolling(5).mean().iloc[-1]
-    ma10 = df['close'].rolling(10).mean().iloc[-1]
-    peak_20 = df['close'].rolling(20).max().iloc[-1]
-    dd = (last['close'] - peak_20) / (peak_20 if peak_20 != 0 else 1)
+    ann_return = returns.mean() * 252
+    ann_vol = returns.std() * np.sqrt(252)
+    sharpe = (ann_return - 0.02) / ann_vol if ann_vol != 0 else 0
     
-    score = 0
-    if last['close'] > ma5 and dd < -0.05:
-        score = 1
-        if last['close'] > ma10: score += 1
-        if last['amount'] > df['amount'].rolling(5).mean().iloc[-1]: score += 1
-        if 'vol' in df.columns and last['vol'] > 0:
-            if last['vol'] < df['vol'].rolling(10).mean().iloc[-1]: score += 1
+    cum_ret = (1 + returns).cumprod()
+    mdd = ((cum_ret - cum_ret.cummax()) / cum_ret.cummax()).min()
+    
+    return {
+        'atr': df['atr'].iloc[-1],
+        'sharpe': round(sharpe, 2),
+        'mdd_pct': round(mdd * 100, 2)
+    }
 
-    if score >= MIN_SCORE_SHOW:
-        risk = TOTAL_CAPITAL * 0.02
-        stop_p = last['close'] * 0.96
-        shares = int(risk / max(last['close'] - stop_p, 0.01) // 100 * 100)
-        return {'score': score, 'price': last['close'], 'stop': stop_p, 'shares': shares, 'dd': dd * 100}
-    return None
+# --- 3. 策略与仓位模块 ---
+def analyze_signal(file_path):
+    try:
+        df = pd.read_csv(file_path)
+        df.columns = [c.lower().strip() for c in df.columns]
+        
+        metrics = calculate_metrics(df)
+        if not metrics or metrics['sharpe'] < CONFIG['MIN_SHARPE'] or metrics['mdd_pct'] < CONFIG['MAX_DD_LIMIT']:
+            return None
+        
+        last = df.iloc[-1]
+        ma5 = df['close'].rolling(5).mean().iloc[-1]
+        
+        # 信号逻辑：价格回踩后站上5日线
+        peak_20 = df['close'].tail(20).max()
+        dd_from_peak = (last['close'] - peak_20) / peak_20
+        
+        score = 0
+        if last['close'] > ma5 and dd_from_peak < -0.05:
+            score += 2  # 基础信号
+            if last['amount'] > df['amount'].tail(5).mean(): score += 1 # 量能加分
+            
+        if score < 2: return None
 
-# --- 3. 执行引擎 ---
-def execute():
-    bj_now = get_beijing_time()
-    db = load_fund_db()
-    results = []
-    
-    files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+        # --- 精准实盘配仓 ---
+        # 考虑滑点后的拟成交价
+        est_price = last['close'] * (1 + CONFIG['FEE_SLIPPAGE'])
+        # 动态止损：2倍ATR
+        stop_price = est_price - (2 * metrics['atr'])
+        risk_per_share = est_price - stop_price
+        
+        # 股数 = (总资金 * 风险系数) / 每股风险
+        raw_shares = (CONFIG['CAPITAL'] * CONFIG['RISK_PER_TRADE']) / risk_per_share
+        # 限制单只最大金额 (总资金 / 最大持仓数)
+        max_money_per_etf = CONFIG['CAPITAL'] * (CONFIG['TOTAL_POS_LIMIT'] / CONFIG['MAX_HOLDINGS'])
+        limited_shares = min(raw_shares, max_money_per_etf / est_price)
+        
+        final_shares = int(limited_shares // 100 * 100)
+
+        return {
+            'score': score,
+            'price': round(est_price, 3),
+            'stop': round(stop_price, 3),
+            'shares': final_shares,
+            'sharpe': metrics['sharpe'],
+            'mdd': metrics['mdd_pct'],
+            'pos_value': round(final_shares * est_price, 0)
+        }
+    except:
+        return None
+
+# --- 4. 组合决策执行 ---
+def run_portfolio_strategy():
+    all_candidates = []
+    files = glob.glob(os.path.join(CONFIG['DATA_DIR'], "*.csv"))
     
     for f in files:
-        fname = os.path.splitext(os.path.basename(f))[0]
-        code = "".join(filter(str.isdigit, fname)).zfill(6)
-        
-        try:
-            df = pd.read_csv(f)
-            res = analyze_signal(df)
-            if res:
-                info = db.get(code)
-                if info:
-                    name_display = info['name']
-                    index_display = info['index']
-                else:
-                    name_display = f"未匹配({code})"
-                    index_display = "需检查Excel"
-
-                res.update({
-                    'code': code,
-                    'name': name_display,
-                    'index': index_display
-                })
-                results.append(res)
-        except Exception as e:
-            print(f"⚠️ 处理 {code} 失败: {e}")
-            continue
-
-    # 排序：得分高 → 回撤深 优先
-    results.sort(key=lambda x: (x['score'], -x['dd']), reverse=True)
-
-    with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 看板 V15.4\n\n")
-        f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 过滤条件: `得分 ≥ 3`\n\n")
-        
-        if results:
-            f.write("| 代码 | 简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损参考 |\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
-            for s in results:
-                icon = "🔥" * s['score']
-                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {icon} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
-        else:
-            f.write("> 😴 当前市场暂无满足 3 分条件的精英标的。")
+        code = "".join(filter(str.isdigit, os.path.basename(f))).zfill(6)
+        res = analyze_signal(f)
+        if res and res['shares'] > 0:
+            res['code'] = code
+            all_candidates.append(res)
     
-    print(f"✨ 执行完毕！共检测到 {len(results)} 个 3 分以上标的。")
+    # 【核心逻辑】按 夏普比率 * 信号分 排序，选取最优的 N 只
+    all_candidates.sort(key=lambda x: (x['score'] * x['sharpe']), reverse=True)
+    final_selection = all_candidates[:CONFIG['MAX_HOLDINGS']]
+    
+    # 生成指令
+    print(f"📅 执行时间: {datetime.now().strftime('%H:%M')} (建议收盘前5分钟运行)")
+    print(f"🛡️ 组合限制: 最多持有 {CONFIG['MAX_HOLDINGS']} 只 | 单笔风险额: {CONFIG['CAPITAL']*CONFIG['RISK_PER_TRADE']}元")
+    print("-" * 50)
+    
+    if not final_selection:
+        print("今日无符合风控要求的交易指令。")
+    else:
+        for r in final_selection:
+            print(f"【交易指令】代码: {r['code']} | 评分: {r['score']} | 夏普: {r['sharpe']}")
+            print(f"👉 操作: 买入 {r['shares']} 股 | 预估成交价: {r['price']}")
+            print(f"🛑 止损: 价格跌破 {r['stop']} 立即离场")
+            print(f"💰 占用资金: {r['pos_value']}元")
+            print("-" * 30)
 
 if __name__ == "__main__":
-    execute()
+    run_portfolio_strategy()
