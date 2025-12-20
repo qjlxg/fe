@@ -21,18 +21,32 @@ def get_beijing_time():
     return datetime.utcnow() + timedelta(hours=8)
 
 def load_fund_db():
+    """修正版：直接匹配'证券代码'和'证券简称'"""
     fund_db = {}
     if not os.path.exists(EXCEL_DB): return fund_db
     try:
-        df = pd.read_excel(EXCEL_DB, dtype=str, engine='openpyxl')
+        # 支持 xlsx 或由 xlsx 转换的 csv
+        if EXCEL_DB.endswith('.csv'):
+            df = pd.read_csv(EXCEL_DB, dtype=str)
+        else:
+            df = pd.read_excel(EXCEL_DB, dtype=str, engine='openpyxl')
+        
+        # 清洗列名空格
         df.columns = [str(c).strip() for c in df.columns]
-        c_code = next((c for c in df.columns if '代码' in c), None)
-        c_name = next((c for c in df.columns if '简称' in c), None)
-        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '行业', '板块'])), "行业/主题")
+        
+        # 严格匹配你的列名：'证券代码', '证券简称'
+        c_code = '证券代码'
+        c_name = '证券简称'
+        # 行业/板块逻辑：如果列里没有'行业'，则默认为'行业/主题'
+        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '行业', '板块'])), None)
+
         for _, row in df.iterrows():
-            code = "".join(filter(str.isdigit, str(row[c_code]))).zfill(6)
-            fund_db[code] = {'name': str(row[c_name]).strip(), 'index': str(row[c_idx]).strip()}
-    except: pass
+            code = str(row[c_code]).strip().zfill(6)
+            name = str(row[c_name]).strip()
+            sector = str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "行业/主题"
+            fund_db[code] = {'name': name, 'index': sector}
+    except Exception as e:
+        print(f"Excel读取失败: {e}")
     return fund_db
 
 def calculate_all_metrics(df):
@@ -55,7 +69,7 @@ def calculate_all_metrics(df):
 def analyze_signal(df):
     if len(df) < 40: return None
     df.columns = [str(c).strip().lower() for c in df.columns]
-    mapping = {'日期':'date','收盘':'close','成交额':'amount','最高':'high','最低':'low'}
+    mapping = {'日期':'date','收盘':'close','成交额':'amount','最高':'high','最低':'low','收盘价':'close'}
     df.rename(columns=mapping, inplace=True)
     for c in ['close','amount','high','low']: df[c] = pd.to_numeric(df[c], errors='coerce')
     
@@ -78,11 +92,14 @@ def analyze_signal(df):
         risk_money = TOTAL_CAPITAL * 0.02
         theory_invest = risk_money / max((last['close'] - stop_price), 0.001)
         actual_invest = min(theory_invest, TOTAL_CAPITAL * SINGLE_MAX_WEIGHT)
-        return {'score': score, 'price': last['close'], 'stop': stop_price, 'theory_invest': actual_invest, 'dd': dd * 100, 'rsi': last['rsi'], 'avg_amount': last['avg_amount']}
+        return {
+            'score': score, 'price': last['close'], 'stop': stop_price, 
+            'theory_invest': actual_invest, 'dd': dd * 100, 
+            'rsi': last['rsi'], 'avg_amount': last['avg_amount']
+        }
     return None
 
 def save_history(results):
-    """保存全维度数据到历史文件"""
     if not results: return
     bj_date = get_beijing_time().strftime('%Y-%m-%d')
     new_entries = []
@@ -96,43 +113,48 @@ def save_history(results):
     df_new = pd.DataFrame(new_entries)
     if os.path.exists(HISTORY_FILE):
         try:
-            df_old = pd.read_csv(HISTORY_FILE)
+            df_old = pd.read_csv(HISTORY_FILE, dtype={'code': str})
             pd.concat([df_old, df_new]).drop_duplicates(subset=['date', 'code']).to_csv(HISTORY_FILE, index=False, encoding='utf_8_sig')
         except: df_new.to_csv(HISTORY_FILE, index=False, encoding='utf_8_sig')
     else:
         df_new.to_csv(HISTORY_FILE, index=False, encoding='utf_8_sig')
 
 def check_streak(code):
-    """检查近3天是否上榜过"""
     if not os.path.exists(HISTORY_FILE): return False
     try:
-        df_h = pd.read_csv(HISTORY_FILE)
+        df_h = pd.read_csv(HISTORY_FILE, dtype={'code': str})
+        # 检查除今天外，最近3天是否有记录
+        today = get_beijing_time().strftime('%Y-%m-%d')
         three_days_ago = (get_beijing_time() - timedelta(days=3)).strftime('%Y-%m-%d')
-        recent = df_h[df_h['date'] >= three_days_ago]
-        return code in recent['code'].astype(str).values
+        recent = df_h[(df_h['date'] >= three_days_ago) & (df_h['date'] < today)]
+        return code in recent['code'].values
     except: return False
 
 def execute():
-    db = load_fund_db(); raw_candidates = []
+    db = load_fund_db()
+    raw_candidates = []
     files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     for f in files:
         code = "".join(filter(str.isdigit, os.path.basename(f))).zfill(6)
         try:
-            df = pd.read_csv(f); res = analyze_signal(df)
+            df = pd.read_csv(f)
+            res = analyze_signal(df)
             if res:
                 info = db.get(code, {'name': f'未匹配({code})', 'index': '未分类'})
                 res.update({'code': code, 'name': info['name'], 'index': info['index']})
                 raw_candidates.append(res)
         except: continue
 
-    if not raw_candidates: print("😴 今日无高分信号"); return
+    if not raw_candidates:
+        print("😴 今日无高分信号")
+        return
 
-    # 1. 行业选优逻辑修正 (dd 越大负值越多越优先)
     df_c = pd.DataFrame(raw_candidates)
+    # 板块选优：得分降序，回撤深度降序（dd越小负值越大越优），成交额降序
     df_c = df_c.sort_values(by=['index', 'score', 'dd', 'avg_amount'], ascending=[True, False, False, False])
     unique_candidates = df_c.groupby('index').head(1).to_dict('records')
 
-    # 2. 资金缩放与利用率优化
+    # 资金分配优化
     for _ in range(2):
         total_needed = sum(item['theory_invest'] for item in unique_candidates)
         scale_factor = min(1.0, TOTAL_CAPITAL / total_needed) if total_needed > 0 else 1.0
@@ -140,22 +162,20 @@ def execute():
             item['final_lots'] = int((item['theory_invest'] * scale_factor) / item['price'] // 100)
             if item['final_lots'] < 1: item['theory_invest'] = 0 
 
-    # 3. 结果汇总
     final_show = [s for s in unique_candidates if s['final_lots'] >= 1]
     for s in final_show:
         s['pos_percent'] = (s['final_lots'] * 100 * s['price'] / TOTAL_CAPITAL) * 100
         s['is_streak'] = check_streak(s['code'])
     
-    save_history(final_show) # 保存全维度历史
+    save_history(final_show)
     total_used = sum(s['final_lots'] * 100 * s['price'] for s in final_show)
     final_show.sort(key=lambda x: (x['score'], -x['dd'], x['avg_amount']), reverse=True)
 
-    # 4. 报告生成
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 闭环复盘看板 V21.0\n\n")
+        f.write(f"# 🛰️ 闭环复盘看板 V21.1\n\n")
         f.write(f"最后更新: `{get_beijing_time().strftime('%Y-%m-%d %H:%M')}`\n\n")
         f.write(f"> **当前总仓位**: `{total_used / TOTAL_CAPITAL * 100:.1f}%` | **入选标的**: `{len(final_show)} 只`\n\n")
-        f.write("> **策略逻辑**: 3.0xATR止损 | 同行业优选 | 连板检测 | 全维度历史存证\n\n")
+        f.write("> **策略逻辑**: 3.0xATR止损 | 同行业优选 | 连板检测 | 证券代码/简称精准匹配\n\n")
         
         f.write("| 标签 | 代码 | 简称 | 板块 | 得分 | 建议买入 | 预计占用 | 止损位 | 现价 | RSI | 40D回撤 | 均额(万) |\n")
         f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
@@ -164,7 +184,7 @@ def execute():
             icon = "🔥" * s['score']
             f.write(f"| {tag} | {s['code']} | **{s['name']}** | `{s['index']}` | {icon} | **{s['final_lots']} 手** | {s['pos_percent']:.1f}% | {s['stop']:.3f} | {s['price']:.3f} | {s['rsi']:.1f} | {s['dd']:.1f}% | {int(s['avg_amount']/10000)} |\n")
 
-    print(f"✨ 扫描完毕。信号已存入 {HISTORY_FILE}, 看板已更新。")
+    print(f"✨ 修复版执行完毕。代码: {len(final_show)} 只, 匹配库: {len(db)} 条")
 
 if __name__ == "__main__":
     execute()
