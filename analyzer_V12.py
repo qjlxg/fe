@@ -8,137 +8,163 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # --- 核心配置 ---
-TOTAL_CAPITAL = 10000       
+TOTAL_CAPITAL = 10000        # 总可用资金
+SINGLE_MAX_WEIGHT = 0.3      # 单只基金最大占用资金上限 (30%)
 DATA_DIR = 'fund_data'
 REPORT_FILE = 'README.md'
-MIN_SCORE_SHOW = 3  # 严格执行：只显示 3 分及以上精英信号
+MIN_SCORE_SHOW = 3           # 只有总分 >= 3 才会被列入看板
 EXCEL_DB = 'ETF列表.xlsx' 
 
 def get_beijing_time():
     return datetime.utcnow() + timedelta(hours=8)
 
-# --- 1. 深度匹配引擎（适配你的Excel格式） ---
 def load_fund_db():
     fund_db = {}
     if not os.path.exists(EXCEL_DB):
-        print(f"❌ 找不到数据库: {EXCEL_DB}")
         return fund_db
-
     try:
-        # 强制以字符串读取，避免代码变成浮点数
         df = pd.read_excel(EXCEL_DB, dtype=str, engine='openpyxl')
         df.columns = [str(c).strip() for c in df.columns]
-        
-        # 匹配“证券代码”和“证券简称”列（支持常见变体）
         c_code = next((c for c in df.columns if '代码' in c), None)
         c_name = next((c for c in df.columns if '简称' in c or '名称' in c), None)
-        # 可选：追踪指数列（如果以后加了这一列会自动识别）
-        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '标的', '跟踪', '追踪', '行业'])), None)
-
-        if not c_code or not c_name:
-            print(f"❌ Excel 列名无法识别，当前列: {list(df.columns)}")
-            return fund_db
+        c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '标的', '追踪', '行业'])), "行业/主题")
 
         for _, row in df.iterrows():
-            # 处理代码：提取数字，补足6位
-            raw_code = str(row[c_code]).strip()
-            clean_code = "".join(filter(str.isdigit, raw_code)).zfill(6)
-            
-            if clean_code and len(clean_code) == 6:
-                fund_db[clean_code] = {
-                    'name': str(row[c_name]).strip() if not pd.isna(row[c_name]) else "未知基金",
-                    'index': str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "需手动补充指数"
-                }
-
-        print(f"✅ 匹配库加载完成，共 {len(fund_db)} 条记录")
-    except Exception as e:
-        print(f"❌ 解析 Excel 失败: {e}")
+            code = "".join(filter(str.isdigit, str(row[c_code]))).zfill(6)
+            fund_db[code] = {
+                'name': str(row[c_name]).strip(),
+                'index': str(row[c_idx]).strip() if not pd.isna(row.get(c_idx)) else "行业/主题"
+            }
+    except: pass
     return fund_db
 
-# --- 2. 策略逻辑（不变） ---
+def calculate_indicators(df):
+    """计算核心技术指标"""
+    # 基础均线
+    df['ma5'] = df['close'].rolling(5).mean()
+    df['ma10'] = df['close'].rolling(10).mean()
+    df['ma20'] = df['close'].rolling(20).mean()
+    
+    # 1. RSI (14日) - 判断超卖
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    df['rsi'] = 100 - (100 / (1 + (gain / loss)))
+    
+    # 2. MACD - 判断动能翻转
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['hist'] = df['macd'] - df['signal']
+    
+    # 3. 布林带 (20, 2) - 判断支撑位
+    df['std'] = df['close'].rolling(20).std()
+    df['lower_band'] = df['ma20'] - (2 * df['std'])
+    
+    # 4. 20日最高价（算回撤）
+    df['peak_20'] = df['close'].rolling(20).max()
+    
+    return df
+
 def analyze_signal(df):
     if len(df) < 30: return None
     
     df.columns = [str(c).strip().lower() for c in df.columns]
-    mapping = {'日期':'date','收盘':'close','成交额':'amount','振幅':'vol','换手率':'turnover'}
+    mapping = {'日期':'date','收盘':'close','成交额':'amount','收盘价':'close'}
     df.rename(columns=mapping, inplace=True)
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
     
-    for col in ['close','amount','vol']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
+    df = calculate_indicators(df)
     last = df.iloc[-1]
-    ma5 = df['close'].rolling(5).mean().iloc[-1]
-    ma10 = df['close'].rolling(10).mean().iloc[-1]
-    peak_20 = df['close'].rolling(20).max().iloc[-1]
-    dd = (last['close'] - peak_20) / (peak_20 if peak_20 != 0 else 1)
+    prev = df.iloc[-2]
+    
+    # 计算当前回撤
+    dd = (last['close'] - last['peak_20']) / last['peak_20']
     
     score = 0
-    if last['close'] > ma5 and dd < -0.05:
-        score = 1
-        if last['close'] > ma10: score += 1
-        if last['amount'] > df['amount'].rolling(5).mean().iloc[-1]: score += 1
-        if 'vol' in df.columns and last['vol'] > 0:
-            if last['vol'] < df['vol'].rolling(10).mean().iloc[-1]: score += 1
+    # --- 维度 1: 基础超跌反弹 ---
+    if last['close'] > last['ma5'] and dd < -0.04:
+        score += 1
+        
+        # --- 维度 2: 动能确认 (MACD) ---
+        # 逻辑：红柱增长 或 绿柱缩短
+        if last['hist'] > prev['hist']:
+            score += 1
+            
+        # --- 维度 3: 超卖保护 (RSI) ---
+        # 逻辑：RSI在低位（<50）才有价值，若RSI太高说明没跌透
+        if last['rsi'] < 45:
+            score += 1
+            
+        # --- 维度 4: 支撑确认 (布林带) ---
+        # 逻辑：价格在下轨附近收回
+        if last['close'] < last['lower_band'] * 1.05:
+            score += 1
+
+        # --- 维度 5: 成交量确认 ---
+        if last['amount'] > df['amount'].rolling(5).mean().iloc[-1]:
+            score += 1
 
     if score >= MIN_SCORE_SHOW:
-        risk = TOTAL_CAPITAL * 0.02
-        stop_p = last['close'] * 0.96
-        shares = int(risk / max(last['close'] - stop_p, 0.01) // 100 * 100)
-        return {'score': score, 'price': last['close'], 'stop': stop_p, 'shares': shares, 'dd': dd * 100}
+        # 仓位计算：单笔亏损控制在本金 2%
+        risk_per_trade = TOTAL_CAPITAL * 0.02
+        stop_loss_rate = 0.05 # 设 5% 为止损宽度
+        
+        # 考虑资金限额 (30% 限制)
+        max_invest = TOTAL_CAPITAL * SINGLE_MAX_WEIGHT
+        theory_invest = risk_per_trade / stop_loss_rate
+        
+        actual_invest = min(theory_invest, max_invest)
+        lots = int((actual_invest / last['close']) // 100)
+        
+        if lots < 1: return None
+
+        return {
+            'score': score,
+            'price': last['close'],
+            'stop': last['close'] * (1 - stop_loss_rate),
+            'lots': lots,
+            'dd': dd * 100,
+            'rsi': last['rsi']
+        }
     return None
 
-# --- 3. 执行引擎 ---
 def execute():
     bj_now = get_beijing_time()
     db = load_fund_db()
     results = []
     
     files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
-    
     for f in files:
-        fname = os.path.splitext(os.path.basename(f))[0]
-        code = "".join(filter(str.isdigit, fname)).zfill(6)
-        
+        code = "".join(filter(str.isdigit, os.path.basename(f))).zfill(6)
         try:
             df = pd.read_csv(f)
             res = analyze_signal(df)
             if res:
-                info = db.get(code)
-                if info:
-                    name_display = info['name']
-                    index_display = info['index']
-                else:
-                    name_display = f"未匹配({code})"
-                    index_display = "需检查Excel"
-
-                res.update({
-                    'code': code,
-                    'name': name_display,
-                    'index': index_display
-                })
+                info = db.get(code, {'name': f'未匹配({code})', 'index': '需手动检查'})
+                res.update({'code': code, 'name': info['name'], 'index': info['index']})
                 results.append(res)
-        except Exception as e:
-            print(f"⚠️ 处理 {code} 失败: {e}")
-            continue
+        except: continue
 
-    # 排序：得分高 → 回撤深 优先
     results.sort(key=lambda x: (x['score'], -x['dd']), reverse=True)
 
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 看板 V15.4\n\n")
-        f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 过滤条件: `得分 ≥ 3`\n\n")
+        f.write(f"# 🛰️ ETF 综合策略看板 (增强版)\n\n")
+        f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 策略：**多维度指标共振 (Score >= 3)**\n\n")
+        f.write("> **评分标准**：RSI低位(1) + MACD转强(1) + 布林带下轨支撑(1) + 站上5日线(1) + 放量(1)\n\n")
         
         if results:
-            f.write("| 代码 | 简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损参考 |\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            f.write("| 代码 | 简称 | 追踪指数/行业 | 得分 | 建议买入 | 止损位 | 现价 | RSI | 回撤 |\n")
+            f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
             for s in results:
                 icon = "🔥" * s['score']
-                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {icon} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
+                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {icon} | **{s['lots']} 手** | {s['stop']:.3f} | {s['price']:.3f} | {s['rsi']:.1f} | {s['dd']:.1f}% |\n")
         else:
-            f.write("> 😴 当前市场暂无满足 3 分条件的精英标的。")
+            f.write("> 😴 当前市场信号疲软，暂未发现高质量共振标的。")
     
-    print(f"✨ 执行完毕！共检测到 {len(results)} 个 3 分以上标的。")
+    print(f"✨ 执行完毕，捕捉到 {len(results)} 个高质量信号。")
 
 if __name__ == "__main__":
     execute()
