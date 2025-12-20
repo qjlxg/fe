@@ -46,18 +46,32 @@ def load_fund_db():
     except Exception as e:
         print(f"❌ 解析 Excel 失败: {e}")
     return fund_db
-# --- 3. ETF策略引擎（带调试版） ---
+# --- 3. ETF策略引擎（带调试版 - 修正版） ---
 def analyze_etf_signal_debug(df, code, fund_db):
     """
     带调试信息的策略分析
+    返回: (result_dict, debug_dict)
     """
+    # 基础信息获取
+    info = fund_db.get(code)
+    name = info['name'] if info else f"未匹配({code})"
+    
+    # 错误检查
     if len(df) < 30: 
-        return None, f"数据不足(仅{len(df)}行)"
+        return None, {
+            'code': code, 'name': name, 'score': 0, 'price': 0,
+            'reasons': [], 'fail_reasons': [f"数据不足(仅{len(df)}行)"],
+            'raw_data': {}
+        }
     
     # 确保列名存在
     required_cols = ['日期', '收盘', '成交量', '振幅']
     if not all(col in df.columns for col in required_cols):
-        return None, f"列名缺失: 需要{required_cols}, 实际有{list(df.columns)}"
+        return None, {
+            'code': code, 'name': name, 'score': 0, 'price': 0,
+            'reasons': [], 'fail_reasons': [f"列名缺失: 需要{required_cols}"],
+            'raw_data': {}
+        }
     
     # 数据清洗
     df['收盘'] = pd.to_numeric(df['收盘'], errors='coerce')
@@ -66,7 +80,11 @@ def analyze_etf_signal_debug(df, code, fund_db):
     df.dropna(subset=['收盘', '成交量'], inplace=True)
     
     if len(df) < 30: 
-        return None, "清洗后数据不足30行"
+        return None, {
+            'code': code, 'name': name, 'score': 0, 'price': 0,
+            'reasons': [], 'fail_reasons': ["清洗后数据不足30行"],
+            'raw_data': {}
+        }
         
     # 计算指标
     last = df.iloc[-1]
@@ -108,10 +126,6 @@ def analyze_etf_signal_debug(df, code, fund_db):
         reasons.append(f"✅ 接近高点: 回撤{dd*100:.2f}% > -2%")
     else:
         fail_reasons.append(f"❌ 回撤过大: 回撤{dd*100:.2f}% <= -2%")
-    
-    # 获取基金名称
-    info = fund_db.get(code)
-    name = info['name'] if info else f"未匹配({code})"
     
     # 组装调试信息
     debug_info = {
@@ -212,8 +226,12 @@ def execute():
         for item in debug_logs:
             f.write(f"## {item['code']} - {item['name']}\\n")
             f.write(f"**最终得分**: {item['score']}/{MIN_SCORE_SHOW} \\n")
-            f.write(f"**当前价格**: {item['raw_data']['price']:.3f}\\n\\n")
             
+            if 'price' in item and item['price'] > 0:
+                f.write(f"**当前价格**: {item['price']:.3f}\\n\\n")
+            else:
+                f.write(f"**当前价格**: 无数据\\n\\n")
+                
             if item['reasons']:
                 f.write("**✅ 通过条件:**  \\n")
                 for r in item['reasons']:
@@ -228,7 +246,9 @@ def execute():
             else:
                 f.write("**❌ 未通过条件:** 无\\n")
                 
-            f.write(f"**📊 原始数据:** MA5={item['raw_data']['ma5']:.3f}, MA10={item['raw_data']['ma10']:.3f}, Vol={item['raw_data']['vol']:.0f}, VolMA={item['raw_data']['vol_ma5']:.0f}, DD={item['raw_data']['dd']:.2f}%\\n")
+            if 'raw_data' in item and item['raw_data']:
+                rd = item['raw_data']
+                f.write(f"**📊 原始数据:** MA5={rd.get('ma5', 0):.3f}, MA10={rd.get('ma10', 0):.3f}, Vol={rd.get('vol', 0):.0f}, VolMA={rd.get('vol_ma5', 0):.0f}, DD={rd.get('dd', 0):.2f}%\\n")
             f.write("---\\n\\n")
             
     print(f"✨ 执行完毕！")
