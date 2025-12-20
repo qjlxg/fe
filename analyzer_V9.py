@@ -126,7 +126,7 @@ def execute():
     results.sort(key=lambda x: (x['score'], -x['dd']), reverse=True)
 
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 天枢 ETF 精英看板 V15.4\n\n")
+        f.write(f"# 🛰️ 看板 V15.4\n\n")
         f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 过滤条件: `得分 ≥ 3`\n\n")
         
         if results:
