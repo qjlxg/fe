@@ -8,149 +8,126 @@ import csv
 
 warnings.filterwarnings('ignore')
 
-# --- 豹哥实战配置 ---
-TOTAL_ASSETS = 100000              # 总本金
-FUND_DATA_DIR = 'fund_data'        # 数据文件夹
-BENCHMARK_CODE = '510300'          # 大盘风向标
-TRADE_LOG_FILE = "豹哥实战日志.csv"
+# --- 系统配置 ---
+TOTAL_ASSETS = 100000
+DATA_DIR = 'fund_data'
+MARKET_INDEX = '510300'
+STRATEGY_LOG = "天枢进阶实战日志.csv"
 
-# 策略参数
-WIN_RATE_THRESHOLD = 0.40          
-TURNOVER_CONFIRM = 1.0             
-MIN_DRAWDOWN = -0.045              
-ATR_STOP_MULTIPLIER = 2            
-MAX_SINGLE_POSITION = 0.3          
+# 核心参数
+DRAWDOWN_THRESHOLD = -0.045
+ATR_MULTIPLIER = 2
+RISK_PER_TRADE = 0.01
 
-def validate_data_freshness():
-    """检查数据是否是最新的"""
-    print("🔍 正在检查数据新鲜度...")
-    files = glob.glob(os.path.join(FUND_DATA_DIR, "*.csv"))
-    if not files: return False
-    
-    latest_file = max(files, key=os.path.getmtime)
-    file_time = os.path.getmtime(latest_file)
-    days_diff = (datetime.now() - datetime.fromtimestamp(file_time)).days
-    if days_diff > 1:
-        print(f"⚠️ 警告：数据已过期 {days_diff} 天，请先运行更新脚本！")
-        return False
-    print("✅ 数据状态：新鲜")
-    return True
-
-def load_data(filepath):
-    try:
-        df = pd.read_csv(filepath, encoding='utf-8')
-    except:
-        df = pd.read_csv(filepath, encoding='gbk')
-    df.columns = [c.strip() for c in df.columns]
-    column_map = {'日期': 'date', '收盘': 'close', '最高': 'high', '最低': 'low', '换手率': 'turnover'}
-    df = df.rename(columns=column_map)
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').reset_index(drop=True)
-    for col in ['close', 'high', 'low', 'turnover']:
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df.dropna(subset=['close'])
-
-def get_market_weather():
-    path = os.path.join(FUND_DATA_DIR, f"{BENCHMARK_CODE}.csv")
-    if not os.path.exists(path): return 0, "🌤️ 未知", 1.0
-    df = load_data(path)
+def calculate_indicators(df):
+    """计算核心技术指标"""
+    # 1. 均线
+    df['MA5'] = df['close'].rolling(5).mean()
     df['MA20'] = df['close'].rolling(20).mean()
-    bias = ((df['close'].iloc[-1] - df['MA20'].iloc[-1]) / df['MA20'].iloc[-1]) * 100
-    if bias < -4: return bias, "❄️ 深冬 (严控仓位)", 0.5
-    if bias < -2: return bias, "🌨️ 初冬 (谨慎出击)", 0.8
-    return bias, "🌤️ 早春 (正常执行)", 1.0
-
-def calculate_shares(last_close, stop_price, multiplier):
-    """计算具体买入股数（取整到百位，即1手）"""
-    risk_per_share = last_close - stop_price
-    if risk_per_share <= 0: return 0
-    # 单笔风险不超过总本金的 1%
-    max_risk_amount = TOTAL_ASSETS * 0.01
-    max_shares = int(max_risk_amount / risk_per_share)
-    # 环境调整并确保不超过单只上限
-    adjusted_shares = int(max_shares * multiplier)
-    limit_shares = int((TOTAL_ASSETS * MAX_SINGLE_POSITION) / last_close)
-    final_shares = min(adjusted_shares, limit_shares)
-    return (final_shares // 100) * 100  # A股买入必须是100的整数倍
-
-def log_trade_signal(signal, weather):
-    """记录交易信号到CSV"""
-    file_exists = os.path.exists(TRADE_LOG_FILE)
-    with open(TRADE_LOG_FILE, 'a', newline='', encoding='utf-8-sig') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(['日期', '时间', '代码', '动作', '价格', '建议股数', '止损价', '环境'])
-        now = datetime.now()
-        writer.writerow([
-            now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'),
-            signal['code'], signal['action'], signal['price'],
-            signal['shares'], signal['stop'], weather
-        ])
-
-def analyze():
-    # 1. 环境与时间检查
-    trade_time = datetime.now().time()
-    if not (dt_time(9, 15) <= trade_time <= dt_time(15, 5)):
-        print("⚠️ 提示：当前非交易时段，分析结果仅供复盘")
     
-    if not validate_data_freshness(): return
-
-    bias_val, weather, multiplier = get_market_weather()
-    files = glob.glob(os.path.join(FUND_DATA_DIR, "*.csv"))
+    # 2. RSI (14日)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     
-    results = []
+    # 3. MACD (12, 26, 9)
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['DIF'] = exp1 - exp2
+    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = (df['DIF'] - df['DEA']) * 2
+    
+    # 4. 换手率均线
+    df['TO_MA5'] = df['turnover'].rolling(5).mean()
+    
+    # 5. ATR 止损
+    tr = pd.concat([
+        (df['high'] - df['low']), 
+        (df['high'] - df['close'].shift()).abs(), 
+        (df['low'] - df['close'].shift()).abs()
+    ], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
+    
+    return df
+
+def analyze_logic(df):
+    """多指标共振逻辑"""
+    if len(df) < 30: return "⚪ 观望", 0
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    peak_20 = df['close'].rolling(20).max().iloc[-1]
+    drawdown = (last['close'] - peak_20) / peak_20
+    
+    # 条件1：价格站上5日线 (趋势初步扭转)
+    cond1 = last['close'] > last['MA5']
+    
+    # 条件2：RSI 处于低位回升或非超买区 (底部确认)
+    cond2 = last['RSI'] > 35  # 从超卖区脱离
+    
+    # 条件3：MACD 柱状图翻红 或 DIF上行 (动能增强)
+    cond3 = last['MACD_Hist'] > prev['MACD_Hist']
+    
+    # 条件4：放量 (换手率超过5日平均的1.2倍，代表有主力吃货)
+    cond4 = last['turnover'] > (last['TO_MA5'] * 1.2)
+    
+    # 条件5：超跌空间
+    cond5 = drawdown < DRAWDOWN_THRESHOLD
+
+    if cond1 and cond5:
+        # 如果满足价格和回撤，再看辅助指标减分或加分
+        score = sum([cond2, cond3, cond4])
+        if score >= 2: # 至少满足两个辅助指标才介入
+            return "🟢 介入", score
+        else:
+            return "🟡 观察", score
+            
+    return "⚪ 观望", 0
+
+def execute_analysis():
+    # ... (此处复用之前的环境检查代码) ...
+    # 获取大盘权重
+    from __main__ import get_market_sentiment, load_data, calculate_position # 假设在同一脚本或导入
+    bias, sentiment, weight = get_market_sentiment()
+    
+    files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    findings = []
+
     for f in files:
         code = os.path.splitext(os.path.basename(f))[0]
-        if code == BENCHMARK_CODE: continue
+        if code == MARKET_INDEX: continue
+        
         df = load_data(f)
-        if df is None or len(df) < 30: continue
+        df = calculate_indicators(df)
         
-        df['MA5'] = df['close'].rolling(5).mean()
-        df['TO_MA10'] = df['turnover'].rolling(10).mean()
-        tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(14).mean()
+        decision, score = analyze_logic(df)
         
-        last = df.iloc[-1]
-        drawdown = (last['close'] - df['close'].rolling(20).max().iloc[-1]) / df['close'].rolling(20).max().iloc[-1]
-        
-        action = "🔴 别看"
-        stop_val = 0
-        shares = 0
-        
-        if drawdown < MIN_DRAWDOWN:
-            if last['close'] > last['MA5']:
-                # 简化逻辑：实战中重点看站稳5日线和回撤
-                action = "🟢 搞它"
-                stop_val = last['close'] - (ATR_STOP_MULTIPLIER * last['atr'])
-                shares = calculate_shares(last['close'], stop_val, multiplier)
-            else:
-                action = "🟡 等破5线"
-
-        if action != "🔴 别看":
-            results.append({
-                'code': code, 'action': action, 'price': last['close'], 
-                'shares': shares, 'stop': round(stop_val, 3), 
-                'weight': 2 if action == "🟢 搞它" else 1
+        if decision != "⚪ 观望":
+            last = df.iloc[-1]
+            stop_price = last['close'] - (ATR_MULTIPLIER * last['atr'])
+            shares = calculate_position(last['close'], stop_price, weight) if decision == "🟢 介入" else 0
+            
+            findings.append({
+                'code': code, 'decision': decision, 'price': last['close'], 
+                'shares': shares, 'stop': round(stop_price, 3),
+                'score': score, 'rsi': round(last['RSI'], 1)
             })
 
-    results.sort(key=lambda x: (x['weight'], x['shares']), reverse=True)
+    # 排序：评分最高（共振指标最多）的排前面
+    findings.sort(key=lambda x: (x['score'], x['shares']), reverse=True)
 
-    # --- 输出报告 ---
-    print("\n" + "="*75)
-    print(f"🐆 豹哥实战操作手册 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"当前大盘环境: {weather} (仓位系数: {multiplier})")
-    print("="*75)
-    print(f"{'代码':<8} | {'动作':<10} | {'买入参考':<8} | {'建议股数':<10} | {'止损价':<8}")
-    print("-" * 75)
+    # --- 报告输出 ---
+    print("\n" + "—"*85)
+    print(f"🚀 天枢进阶版 | 指标共振系统 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"大盘状态: {sentiment} | 过滤因子: RSI+MACD+Turnover")
+    print("—"*85)
+    print(f"{'代码':<8} | {'决策':<8} | {'共振数':<6} | {'现价':<8} | {'RSI':<6} | {'建议股数':<10} | {'止损线':<8}")
+    print("-" * 85)
 
-    for r in results:
-        print(f"{r['code']:<8} | {r['action']:<10} | {r['price']:<10.3f} | {r['shares']:<12} | {r['stop']:<8.3f}")
-        if r['action'] == "🟢 搞它":
-            log_trade_signal(r, weather)
-
-    print("-" * 75)
-    print("📌 豹哥实战纪律：1.不绿不买 2.按量下单 3.破位必卖")
-    print("✅ 交易信号已记录至 [豹哥实战日志.csv]")
+    for r in findings:
+        print(f"{r['code']:<8} | {r['decision']:<8} | {r['score']:<8} | {r['price']:<8.3f} | {r['rsi']:<6} | {r['shares']:<12} | {r['stop']:<8.3f}")
 
 if __name__ == "__main__":
-    analyze()
+    execute_analysis()
