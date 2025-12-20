@@ -7,125 +7,129 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# --- 配置 ---
+# --- 核心配置 ---
 TOTAL_CAPITAL = 100000       
 DATA_DIR = 'fund_data'
-TRACKER_FILE = 'signal_performance_tracker.csv'
 REPORT_FILE = 'README.md'
 MARKET_INDEX = '510300'
-MIN_SCORE_SHOW = 3
 
 def get_beijing_time():
     return datetime.utcnow() + timedelta(hours=8)
 
-# --- 1. 强化版本地数据库匹配 ---
-def load_local_db():
-    db = {}
+# --- 1. 强力本地数据库解析引擎 ---
+def load_fund_db():
+    fund_db = {}
     
-    def clean_code(x):
-        try: return str(int(float(x))).zfill(6)
-        except: return str(x).strip().zfill(6)
+    def get_col(df, keywords):
+        """模糊匹配列名，防止空格或不可见字符干扰"""
+        for k in keywords:
+            for c in df.columns:
+                if k in str(c): return c
+        return None
 
-    # 沪市表处理
-    sh_file = 'ETF列表沪.xls - 基金列表.csv'
-    if os.path.exists(sh_file):
+    # 处理沪市/深市文件
+    for info_file in ['ETF列表沪.xls - 基金列表.csv', 'ETF列表深.xlsx - ETF列表.csv']:
+        if not os.path.exists(info_file): continue
         try:
-            df_sh = pd.read_csv(sh_file, encoding='utf-8-sig')
-            # 自动寻找包含“代码”、“简称”、“指数”的列
-            code_col = [c for c in df_sh.columns if '代码' in c][0]
-            name_col = [c for c in df_sh.columns if '简称' in c][0]
-            idx_col = [c for c in df_sh.columns if '指数' in c or '标的' in c][0]
+            # 使用 utf-8-sig 自动处理 BOM 头
+            df = pd.read_csv(info_file, encoding='utf-8-sig', dtype=str)
             
-            for _, row in df_sh.iterrows():
-                c = clean_code(row[code_col])
-                db[c] = {
-                    'name': str(row[name_col]).strip(),
-                    'index': str(row[idx_col]).strip() if not pd.isna(row[idx_col]) else "宽基/策略"
-                }
-        except Exception as e: print(f"沪市表读取失败: {e}")
-
-    # 深市表处理
-    sz_file = 'ETF列表深.xlsx - ETF列表.csv'
-    if os.path.exists(sz_file):
-        try:
-            df_sz = pd.read_csv(sz_file, encoding='utf-8-sig')
-            code_col = [c for c in df_sz.columns if '代码' in c][0]
-            name_col = [c for c in df_sz.columns if '简称' in c][0]
-            idx_col = [c for c in df_sz.columns if '指数' in c or '拟合' in c][0]
+            # 定位关键列
+            c_code = get_col(df, ['代码', '证券代码', '基金代码'])
+            c_name = get_col(df, ['简称', '证券简称', '基金简称'])
+            c_idx  = get_col(df, ['指数', '拟合', '标的'])
             
-            for _, row in df_sz.iterrows():
-                c = clean_code(row[code_col])
-                db[c] = {
-                    'name': str(row[name_col]).strip(),
-                    'index': str(row[idx_col]).strip() if not pd.isna(row[idx_col]) else "宽基/策略"
-                }
-        except Exception as e: print(f"深市表读取失败: {e}")
-    
-    return db
+            if c_code and c_name:
+                for _, row in df.iterrows():
+                    raw_code = str(row[c_code]).strip().split('.')[0].zfill(6)
+                    if len(raw_code) != 6: continue
+                    
+                    name = str(row[c_name]).strip()
+                    idx = str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "-"
+                    if idx == "-": idx = "宽基/策略指数"
+                    
+                    fund_db[raw_code] = {'name': name, 'index': idx}
+        except Exception as e:
+            print(f"解析 {info_file} 出错: {e}")
+            
+    return fund_db
 
-# --- 2. 增强型策略引擎 ---
-def analyze_logic(df):
+# --- 2. 深度数据挖掘算法 (利用换手率、振幅、成交额) ---
+def analyze_enhanced(df):
     if len(df) < 30: return None
-    # 修正列名映射
-    mapping = {'日期':'date','收盘':'close','成交额':'amount','换手率':'turnover','最高':'high','最低':'low'}
+    
+    # 统一列名清洗
+    df.columns = [str(c).strip() for c in df.columns]
+    mapping = {'日期':'date','收盘':'close','成交额':'amount','换手率':'turnover','振幅':'vol','最高':'high','最低':'low'}
     df.rename(columns=mapping, inplace=True)
     df.columns = [c.lower() for c in df.columns]
+    
+    # 转换数值
+    for col in ['close','amount','turnover','vol','high','low']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     
     last = df.iloc[-1]
     ma5 = df['close'].rolling(5).mean().iloc[-1]
     ma10 = df['close'].rolling(10).mean().iloc[-1]
-    amt_ma5 = df['amount'].rolling(5).mean().iloc[-1]
     peak_20 = df['close'].rolling(20).max().iloc[-1]
     dd = (last['close'] - peak_20) / peak_20
     
     score = 0
+    # 1分：基本面企稳（超跌 + 站上5日线）
     if last['close'] > ma5 and dd < -0.06:
         score = 1
+        # 2分：趋势转强（站上10日线）
         if last['close'] > ma10: score += 1
-        if last['amount'] > amt_ma5: score += 1
-        # 利用 CSV 里的“振幅”数据：若近期振幅收敛，代表变盘在即
-        if '振幅' in df.columns:
-            if df['振幅'].tail(3).mean() < df['振幅'].tail(20).mean(): score += 1
-            
-    if score >= 1:
-        risk = TOTAL_CAPITAL * 0.02
-        stop = ma10 * 0.97
-        shares = int(risk / max(last['close'] - stop, 0.01) // 100 * 100)
-        return {'score':score, 'price':last['close'], 'stop':stop, 'shares':shares, 'dd':dd*100, 'turnover':last.get('换手率',0)}
+        # 3分：主力确认（换手率较昨日温和放大 或 成交额大于5日均值）
+        avg_amt5 = df['amount'].rolling(5).mean().iloc[-1]
+        if last['amount'] > avg_amt5: score += 1
+        # 4分额外奖励：波动收敛（缩量磨底后的小阳线）
+        if 'vol' in df.columns:
+            if last['vol'] < df['vol'].rolling(10).mean().iloc[-1]: score += 1
+
+    if score >= 3:
+        risk_money = TOTAL_CAPITAL * 0.02
+        stop_p = ma10 * 0.97
+        shares = int(risk_money / max(last['close'] - stop_p, 0.01) // 100 * 100)
+        return {
+            'score': score, 'price': last['close'], 'stop': stop_p, 
+            'shares': shares, 'dd': dd * 100, 'turnover': last.get('turnover', 0)
+        }
     return None
 
-# --- 3. 执行 ---
+# --- 3. 执行主流程 ---
 def execute():
     bj_now = get_beijing_time()
-    db = load_local_db()
+    fund_db = load_fund_db()
     all_signals = []
     
     files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     for f in files:
-        code = os.path.splitext(os.path.basename(f))[0]
+        code = os.path.splitext(os.path.basename(f))[0].zfill(6)
         if code == MARKET_INDEX: continue
         try:
-            res = analyze_logic(pd.read_csv(f))
+            res = analyze_enhanced(pd.read_csv(f))
             if res:
-                info = db.get(code, {'name': '未知标的', 'index': '-'})
+                info = fund_db.get(code, {'name': '未知标的', 'index': '-'})
                 res.update({'code': code, 'name': info['name'], 'index': info['index']})
                 all_signals.append(res)
         except: continue
 
+    # 排序：得分 > 回撤深度
     all_signals.sort(key=lambda x: (x['score'], -x['dd']), reverse=True)
-    elite = [s for s in all_signals if s['score'] >= MIN_SCORE_SHOW]
 
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 天枢 ETF 精英看板 V12.0\n\n")
-        f.write(f"最后同步 (北京): `{bj_now.strftime('%Y-%m-%d %H:%M')}`\n\n")
-        f.write("### 🎯 高胜率共振信号 (得分 ≥ 3)\n")
-        if elite:
-            f.write("| 代码 | 基金简称 | 追踪指数 | ROC/回撤 | 得分 | 现价 | 建议买入 | 止损位 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
-            for s in elite:
-                score_icon = "🔥" * s['score']
-                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {score_icon} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
+        f.write(f"# 🛰️ 天枢 ETF 精英看板 V13.0\n\n")
+        f.write(f"更新时间: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 数据库: `沪深全量本地化适配`\n\n")
+        f.write("### 🎯 顶级共振信号 (量价收敛+超跌反弹)\n")
+        if all_signals:
+            f.write("| 代码 | 基金简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损位 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            for s in all_signals:
+                score_str = "🔥" * s['score']
+                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {score_str} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
         else:
-            f.write("> 😴 今日暂无精英共振信号。")
+            f.write("> 😴 暂无高分共振信号，请耐心等待底部确认。")
 
 if __name__ == "__main__":
     execute()
