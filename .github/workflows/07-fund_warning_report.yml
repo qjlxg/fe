@@ -1,16 +1,14 @@
-name: 07-fund_warning_report_v5.8
+name: 07-fund_warning_report_v6.0
 
 on:
   push:
     paths:
-      - 'analyzer_V5.py'  # 确保这里匹配你的最新文件名
+      - 'analyzer_V6.py'  # 确保匹配你保存的文件名
       - '.github/workflows/**'
-      - 'fund_data/**'
   schedule:
-    # 每天北京时间 15:15 运行（A股收盘后立即分析）
-    # UTC 时间 07:15
+    # 每天北京时间 15:15 运行（收盘后分析）
     - cron: '15 7 * * *'
-  workflow_dispatch: # 允许手动点按钮运行
+  workflow_dispatch: 
 
 jobs:
   analyze_funds:
@@ -32,12 +30,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy
+          # 核心更新：必须安装 akshare 以支持自动数据抓取
+          pip install pandas numpy akshare
 
       - name: Run fund analysis script
         id: analysis
-        # 注意：这里改为你最新的文件名
-        run: python analyzer_V5.py
+        # 确保文件名与你仓库里的一致
+        run: python analyzer_V6.py
 
       - name: Commit and push changes
         if: success()
@@ -45,21 +44,18 @@ jobs:
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          # 1. 添加所有类型的报告
-          git add Trading_Decision_Report_*.md || true
-          git add Strategy_Pro_Report_*.md || true
-          
-          # 2. 关键：添加复盘日志文件，这样历史记录才不会丢
+          # 允许添加新生成的数据文件夹和报告
+          git add fund_data/*.csv || true
+          git add *.md || true
           git add history_signals.csv || true
           
-          # 检查是否有文件变动
           if [ -z "$(git status --porcelain)" ]; then
             echo "No changes detected. Skipping commit."
             exit 0
           fi
           
-          git commit -m "📈 [V5.8] 自动化决策报告与日志同步: $(date +'%Y-%m-%d %H:%M')"
+          git commit -m "📈 [V6.0] 自动行情同步与决策报告: $(date +'%Y-%m-%d %H:%M')"
           
-          # 处理并发冲突
+          # 这里的 rebase 是为了防止多个 workflow 并发冲突
           git pull --rebase origin main
           git push origin main
