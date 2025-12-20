@@ -1,6 +1,7 @@
 import pandas as pd
 import glob
 import os
+import io
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
@@ -12,64 +13,56 @@ TOTAL_CAPITAL = 100000
 DATA_DIR = 'fund_data'
 REPORT_FILE = 'README.md'
 MARKET_INDEX = '510300'
+MIN_SCORE_SHOW = 2  # 调低门槛，让 2 分（潜力）和 3/4 分（精英）都能看到，防止结果忽多忽少
 
 def get_beijing_time():
     return datetime.utcnow() + timedelta(hours=8)
 
-# --- 1. 暴力列名感应与数据清洗 ---
+# --- 1. 工业级数据清洗引擎 ---
 def load_fund_db():
     fund_db = {}
-    # 定义沪深两个本地文件名
     files = ['ETF列表沪.xls - 基金列表.csv', 'ETF列表深.xlsx - ETF列表.csv']
     
     for f_name in files:
-        if not os.path.exists(f_name):
-            continue
+        if not os.path.exists(f_name): continue
         try:
-            # 1. 尝试多种编码读取
-            df = pd.read_csv(f_name, encoding='utf-8-sig', dtype=str)
+            # 彻底解决 BOM 和 特殊换行符
+            with open(f_name, 'r', encoding='utf-8-sig') as f:
+                content = f.read().replace('\r\n', '\n').replace('\r', '\n')
             
-            # 2. 清洗所有列名：去掉空格、换行、制表符
-            df.columns = [str(c).strip() for c in df.columns]
+            df = pd.read_csv(io.StringIO(content), dtype=str)
+            df.columns = [str(c).strip().replace('\ufeff', '') for c in df.columns]
             
-            # 3. 动态寻找列名（不写死，只匹配关键字）
+            # 定位关键列
             c_code = next((c for c in df.columns if '代码' in c), None)
             c_name = next((c for c in df.columns if '简称' in c), None)
             c_idx = next((c for c in df.columns if any(k in c for k in ['指数', '拟合', '标的'])), None)
-            c_size = next((c for c in df.columns if '规模' in c), None)
 
             if c_code and c_name:
                 for _, row in df.iterrows():
-                    # 强力清洗代码：转数字去掉.0再补零
-                    raw_code = str(row[c_code]).strip().split('.')[0].zfill(6)
-                    if len(raw_code) != 6: continue
-                    
+                    code = str(row[c_code]).strip().split('.')[0].zfill(6)
                     name = str(row[c_name]).strip()
-                    idx = str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "指数/宽基"
-                    size = str(row[c_size]).replace('"', '').replace(',', '').strip() if c_size else "0"
+                    idx = str(row[c_idx]).strip() if c_idx and not pd.isna(row[c_idx]) else "-"
+                    if idx == "-" or idx == "nan": idx = "宽基/策略指数"
                     
-                    fund_db[raw_code] = {
-                        'name': name,
-                        'index': idx if idx != '-' else "策略指数",
-                        'size': size
-                    }
+                    fund_db[code] = {'name': name, 'index': idx}
         except Exception as e:
             print(f"解析 {f_name} 失败: {e}")
     return fund_db
 
-# --- 2. 增强型策略引擎 (带波动率过滤) ---
+# --- 2. 增强策略 (区分潜力与精英) ---
 def analyze_signal(df):
     if len(df) < 30: return None
     
-    # 强制对齐 fund_data 中的 CSV 列名
     df.columns = [str(c).strip() for c in df.columns]
-    mapping = {'日期':'date','收盘':'close','成交额':'amount','换手率':'turnover','振幅':'vol'}
+    mapping = {'日期':'date','收盘':'close','成交额':'amount','振幅':'vol','换手率':'turnover'}
     df.rename(columns=mapping, inplace=True)
     df.columns = [c.lower() for c in df.columns]
     
-    for col in ['close','amount','turnover','vol']:
+    # 转换数值并填充空值
+    for col in ['close','amount','vol']:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
     last = df.iloc[-1]
     ma5 = df['close'].rolling(5).mean().iloc[-1]
@@ -78,27 +71,25 @@ def analyze_signal(df):
     dd = (last['close'] - peak_20) / peak_20
     
     score = 0
-    # 评分逻辑：超跌反转 + 量价共振
+    # 基础分：超跌且站上5日线 (1分)
     if last['close'] > ma5 and dd < -0.05:
         score = 1
+        # 2分：确认站上10日线 (趋势初步扭转)
         if last['close'] > ma10: score += 1
-        # 成交额放量
+        # 3分：成交量有效放大 (主力资金入场)
         if last['amount'] > df['amount'].rolling(5).mean().iloc[-1]: score += 1
-        # 波动率收敛（代表磨底成功）
-        if 'vol' in df.columns and last['vol'] < df['vol'].rolling(10).mean().iloc[-1]:
-            score += 1
+        # 4分：波动率收敛 (底部的极致信号)
+        if 'vol' in df.columns and last['vol'] > 0:
+            if last['vol'] < df['vol'].rolling(10).mean().iloc[-1]: score += 1
 
-    if score >= 3:
+    if score >= MIN_SCORE_SHOW:
         risk = TOTAL_CAPITAL * 0.02
-        stop_p = last['close'] * 0.965 # 3.5% 固定止损
-        shares = int(risk / (last['close'] - stop_p) // 100 * 100)
-        return {
-            'score': score, 'price': last['close'], 'stop': stop_p,
-            'shares': shares, 'dd': dd * 100, 'turnover': last.get('turnover', 0)
-        }
+        stop_p = last['close'] * 0.96 # 固定4%止损，实战更稳
+        shares = int(risk / max(last['close'] - stop_p, 0.01) // 100 * 100)
+        return {'score': score, 'price': last['close'], 'stop': stop_p, 'shares': shares, 'dd': dd * 100}
     return None
 
-# --- 3. 执行主程序 ---
+# --- 3. 执行流程 ---
 def execute():
     bj_now = get_beijing_time()
     db = load_fund_db()
@@ -110,24 +101,24 @@ def execute():
         try:
             res = analyze_signal(pd.read_csv(f))
             if res:
-                info = db.get(code, {'name': '未知标的', 'index': '-', 'size': '0'})
-                res.update({'code': code, 'name': info['name'], 'index': info['index'], 'size': info['size']})
+                info = db.get(code, {'name': '未知标的', 'index': '-'})
+                res.update({'code': code, 'name': info['name'], 'index': info['index']})
                 results.append(res)
         except: continue
 
     results.sort(key=lambda x: (x['score'], -x['dd']), reverse=True)
 
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write(f"# 🛰️ 天枢 ETF 精英看板 V13.5\n\n")
-        f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 数据库: `沪深全适配版`\n\n")
-        f.write("### 🎯 高胜率信号 (量价收敛 + 底部放量)\n")
+        f.write(f"# 🛰️ 天枢 ETF 精英看板 V14.0\n\n")
+        f.write(f"最后更新: `{bj_now.strftime('%Y-%m-%d %H:%M')}` | 适配状态: `本地沪深表全量对齐`\n\n")
+        f.write("### 🎯 实时信号追踪 (2分潜力 / 3分及以上精英)\n")
         if results:
-            f.write("| 代码 | 简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损位 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            f.write("| 代码 | 简称 | 追踪指数/行业 | 回撤 | 得分 | 现价 | 建议买入 | 止损参考 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
             for s in results:
-                score_icon = "🔥" * s['score']
-                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {score_icon} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
+                icon = "🔥" * s['score'] if s['score'] >= 3 else "⭐"
+                f.write(f"| {s['code']} | **{s['name']}** | `{s['index']}` | {s['dd']:.1f}% | {icon} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
         else:
-            f.write("> 😴 当前市场波动平淡，暂无精英级别信号。")
+            f.write("> 😴 市场处于横盘震荡，无符合逻辑的超跌信号。")
 
 if __name__ == "__main__":
     execute()
