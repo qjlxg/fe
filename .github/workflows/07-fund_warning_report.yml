@@ -1,11 +1,13 @@
-name: 🚀 V10
+name: 🚀 天枢北京时间同步版
+
 on:
   schedule:
-    - cron: '45 7 * * *' # 北京时间 15:45
+    # 每天北京时间 15:45 运行分析
+    - cron: '45 7 * * *'
   workflow_dispatch: 
 
 jobs:
-  run_bot:
+  analyze:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -20,21 +22,16 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 🛠️ 安装增强依赖
-        run: |
-          pip install pandas numpy akshare
+      - name: 🛠️ 安装依赖库
+        run: pip install pandas numpy akshare
 
-      - name: 📈 运行 V10 核心系统
+      - name: 📈 运行分析 (北京时间转换)
         run: python analyzer_V9.py
 
-      - name: 💾 同步分析结果
+      - name: 💾 推送结果回目录
         run: |
           git config --global user.name "Sky-Pivot-Bot"
           git config --global user.email "bot@quant.com"
-          git add README.md signal_performance_tracker.csv portfolio.csv
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "No change"
-            exit 0
-          fi
-          git commit -m "📊 V10.0 智能看板更新: $(date +'%Y-%m-%d %H:%M')"
-          git push origin main
+          git add README.md portfolio.csv signal_performance_tracker.csv
+          git commit -m "📊 更新看板(北京时间): $(date +'%Y-%m-%d %H:%M')" || echo "No changes"
+          git push
