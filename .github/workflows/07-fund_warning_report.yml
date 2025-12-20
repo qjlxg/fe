@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - 'analyzer_V9.py'
-      - '*.csv'  # 包含沪深列表更新时运行
+      - '.github/workflows/07-fund_warning_report.yml'  
   schedule:
     - cron: '50 7 * * *' # 北京时间 15:50
   workflow_dispatch: 
@@ -24,7 +24,7 @@ jobs:
           python-version: '3.10'
 
       - name: 🛠️ 3. 依赖
-        run: pip install pandas numpy
+        run: pip install pandas numpy openpyxl
 
       - name: 📈 4. 执行本地化分析
         run: python analyzer_V9.py
