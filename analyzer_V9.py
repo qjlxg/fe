@@ -3,6 +3,8 @@ import glob
 import os
 import numpy as np
 from datetime import datetime
+import akshare as ak
+import time
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -10,122 +12,128 @@ warnings.filterwarnings('ignore')
 # --- 系统配置 ---
 TOTAL_ASSETS = 100000
 DATA_DIR = 'fund_data'
-PORTFOLIO_FILE = 'portfolio.csv'  # 持仓记录文件
+PORTFOLIO_FILE = 'portfolio.csv'
 MARKET_INDEX = '510300'
 MAX_HOLD_COUNT = 5
-MIN_DAILY_AMOUNT = 50000000 
+MIN_DAILY_AMOUNT = 50000000
 RISK_PER_TRADE = 0.015
+ETF_DD_THRESHOLD = -0.06
 
-# --- 1. 核心计算与退出逻辑 ---
+# 核心监控池：涵盖宽基、行业、跨境
+ETF_POOL = ["510300", "510500", "588000", "159915", "513100", "512880", "512480", "515030", "159920"]
+
+# --- 1. 自动数据抓取函数 ---
+def update_live_data():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+    print(f"🔄 正在通过 AKShare 更新 {len(ETF_POOL)} 只 ETF 的最新行情...")
+    for code in ETF_POOL:
+        try:
+            # 获取最近 100 个交易日的日线数据
+            df = ak.fund_etf_hist_sina(symbol=code).tail(100)
+            df.columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+            df['turnover'] = df['volume'] / 1000000 # 估算换手
+            df.to_csv(os.path.join(DATA_DIR, f"{code}.csv"), index=False)
+            print(f"✅ {code} 更新成功")
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"⚠️ {code} 更新失败: {e}")
+
+# --- 2. 核心分析函数 ---
+def load_data(file_path):
+    try:
+        df = pd.read_csv(file_path)
+        df.columns = [c.lower() for c in df.columns]
+        df['date'] = pd.to_datetime(df['date'])
+        return df.sort_values('date').reset_index(drop=True)
+    except: return pd.DataFrame()
+
+def get_market_sentiment():
+    mkt_df = load_data(os.path.join(DATA_DIR, f"{MARKET_INDEX}.csv"))
+    if len(mkt_df) < 20: return 0, "数据不足", 1.0
+    ma20 = mkt_df['close'].rolling(20).mean().iloc[-1]
+    bias = (mkt_df['close'].iloc[-1] - ma20) / ma20
+    if bias > 0.02: return bias, "🔥 强劲", 1.2
+    if bias < -0.02: return bias, "❄️ 冰点", 0.6
+    return bias, "⚖️ 平衡", 1.0
+
 def calculate_indicators(df):
-    """计算指标：含 ATR、MA、ROC、MACD、RSI"""
-    if len(df) < 60: return df
+    if len(df) < 30: return df
     df['MA5'] = df['close'].rolling(5).mean()
     df['MA10'] = df['close'].rolling(10).mean()
-    df['MA20'] = df['close'].rolling(20).mean()
-    
     tr = pd.concat([(df['high']-df['low']), (df['high']-df['close'].shift()).abs(), (df['low']-df['close'].shift()).abs()], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
     df['ROC20'] = df['close'].pct_change(20)
-    
-    # MACD
+    # MACD & RSI
     exp1 = df['close'].ewm(span=12, adjust=False).mean(); exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['DIF'] = exp1 - exp2; df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = (df['DIF'] - df['DEA']) * 2
-    
-    # RSI
     delta = df['close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df['RSI'] = 100 - (100 / (1 + gain/loss))
-    df['TO_MA5'] = df['turnover'].rolling(5).mean()
+    df['AMT_MA5'] = df['amount'].rolling(5).mean()
     return df
 
-def check_exit_conditions(code, df, portfolio_row):
-    """持仓卖出信号判定"""
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    reasons = []
-    # 1. 智能止损位触发 (读取账本中的止损价)
-    if last['close'] <= portfolio_row['stop_price']:
-        reasons.append("💥 触发止损")
-    # 2. 趋势破位 (跌破10日线)
-    if last['close'] < last['MA10']:
-        reasons.append("📉 破10日线")
-    # 3. 动能衰竭 (MACD红柱缩短且RSI高位)
-    if last['MACD_Hist'] < prev['MACD_Hist'] and last['RSI'] > 65:
-        reasons.append("⚠️ 动能减弱")
-    
-    return " | ".join(reasons) if reasons else "✅ 正常"
-
-# --- 2. 持仓与扫描执行 ---
+# --- 3. 执行主流程 ---
 def execute_system():
-    # A. 加载持仓账本
+    # 步骤1：更新数据
+    update_live_data()
+    
+    # 步骤2：初始化账本
     if not os.path.exists(PORTFOLIO_FILE):
         pd.DataFrame(columns=['code', 'buy_price', 'shares', 'stop_price']).to_csv(PORTFOLIO_FILE, index=False)
     portfolio = pd.read_csv(PORTFOLIO_FILE)
     
-    # B. 大盘滤网
-    from __main__ import get_market_sentiment # 沿用前述函数
+    # 步骤3：大盘分析
     bias, sentiment, mkt_weight = get_market_sentiment()
     
-    files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
-    new_signals = []
-    hold_monitor = []
+    current_holds = portfolio['code'].astype(str).tolist()
+    new_signals, hold_monitor = [], []
 
-    for f in files:
-        code = os.path.splitext(os.path.basename(f))[0]
-        if code == MARKET_INDEX: continue
-        
-        df = pd.read_csv(f)
-        df.columns = [c.lower() for c in df.columns]
-        df = calculate_indicators(df)
+    # 步骤4：全池扫描
+    for code in ETF_POOL:
+        df = load_data(os.path.join(DATA_DIR, f"{code}.csv"))
         if len(df) < 30: continue
+        df = calculate_indicators(df)
         last = df.iloc[-1]
 
-        # --- 情况 1：监控持仓 ---
-        if code in portfolio['code'].astype(str).values:
+        if code in current_holds:
+            # 监控逻辑
             p_row = portfolio[portfolio['code'].astype(str) == code].iloc[0]
-            status = check_exit_conditions(code, df, p_row)
-            profit = (last['close'] - p_row['buy_price']) / p_row['buy_price']
-            hold_monitor.append({
-                'code': code, 'profit': profit, 'status': status, 
-                'price': last['close'], 'stop': p_row['stop_price']
-            })
-            continue # 持仓券不参与新信号扫描
-
-        # --- 情况 2：扫描新信号 ---
-        if last['amount'] < MIN_DAILY_AMOUNT: continue
-        
-        from __main__ import analyze_etf_logic # 沿用前述逻辑
-        decision, score = analyze_etf_logic(df)
-        
-        if decision != "⚪ 观望":
-            atr_stop = last['close'] - (2 * last['atr'])
-            ma10_stop = last['MA10'] * 0.95
-            stop_p = min(atr_stop, ma10_stop)
+            # 简单止损检查
+            status = "✅ 正常"
+            if last['close'] < p_row['stop_price']: status = "💥 触发止损"
+            elif last['close'] < last['MA10']: status = "📉 破10日线"
             
-            new_signals.append({
-                'code': code, 'roc20': last['ROC20'], 'score': score,
-                'price': last['close'], 'stop': stop_p, 'decision': decision
+            hold_monitor.append({
+                'code': code, 'profit': (last['close']-p_row['buy_price'])/p_row['buy_price']*100,
+                'price': last['close'], 'status': status
             })
+        else:
+            # 信号逻辑
+            drawdown = (last['close'] - df['close'].rolling(20).max().iloc[-1]) / df['close'].rolling(20).max().iloc[-1]
+            if last['close'] > last['MA5'] and drawdown < ETF_DD_THRESHOLD and last['AMT_MA5'] >= MIN_DAILY_AMOUNT:
+                stop_p = min(last['close'] - 2*last['atr'], last['MA10']*0.95)
+                new_signals.append({
+                    'code': code, 'roc': last['ROC20']*100, 'price': last['close'], 'stop': stop_p
+                })
 
-    # --- 3. 结果输出 ---
-    print(f"\n🚀 天枢全仓位管理系统 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"大盘状态: {sentiment} | 建议总仓位权重: {mkt_weight}")
+    # 步骤5：输出可视化报告
+    print("\n" + "="*80)
+    print(f"🚀 天枢实战报告 | 大盘: {sentiment} | 权重: {mkt_weight}")
+    print("="*80)
     
-    # 表格1：持仓监控表
-    print("\n" + "【持仓监控表】" + "—"*70)
-    print(f"{'代码':<8} | {'盈亏%':<8} | {'现价':<8} | {'止损价':<8} | {'状态/建议':<10}")
-    for h in hold_monitor:
-        color_status = f"🚩 {h['status']}" if "✅" not in h['status'] else h['status']
-        print(f"{h['code']:<8} | {h['profit']:>7.2%} | {h['price']:<8.3f} | {h['stop']:<8.3f} | {color_status}")
-
-    # 表格2：新券备选池
-    print("\n" + "【新券入场池】" + "—"*70)
-    new_signals.sort(key=lambda x: (x['roc20'], x['score']), reverse=True)
-    print(f"{'代码':<8} | {'ROC20%':<8} | {'得分':<4} | {'入场参考价':<10} | {'拟设止损':<8}")
-    for s in new_signals[:MAX_HOLD_COUNT]:
-        print(f"{s['code']:<8} | {s['roc20']:>7.2%} | {s['score']:<4} | {s['price']:<10.3f} | {s['stop']:<8.3f}")
+    if hold_monitor:
+        print("\n【持仓监控】")
+        for h in hold_monitor:
+            print(f"🔹 {h['code']} | 收益: {h['profit']:.2f}% | 现价: {h['price']:.3f} | 状态: {h['status']}")
+            
+    if new_signals:
+        print("\n【备选信号】(按强度排序)")
+        new_signals.sort(key=lambda x: x['roc'], reverse=True)
+        for s in new_signals[:3]:
+            print(f"🌟 {s['code']} | ROC20: {s['roc']:.2%}| 现价: {s['price']:.3f} | 建议止损: {s['stop']:.3f}")
+    else:
+        print("\n💡 暂无新入场信号")
 
 if __name__ == "__main__":
     execute_system()
