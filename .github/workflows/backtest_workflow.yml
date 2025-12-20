@@ -1,0 +1,52 @@
+name: Parallel ETF Backtest Workflow
+
+on:
+  # 1. 当脚本或工作流文件变动时自动运行
+  push:
+    paths:
+      - 'etf_backtest_master.py'
+      - '.github/workflows/backtest_workflow.yml'
+    branches: [ main ]
+  
+  # 2. 支持手动点击运行 (Actions 页面)
+  workflow_dispatch:
+
+  # 3. 定时运行 (上海时间每天 18:00)
+  schedule:
+    - cron: '0 10 * * *' # UTC 10:00 = 北京时间 18:00
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  run_backtest:
+    runs-on: ubuntu-latest
+    # 允许工作流向仓库写入文件
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install Dependencies
+      run: |
+        pip install backtrader pandas
+
+    - name: Execute Parallel Backtest
+      run: |
+        python etf_backtest_master.py
+
+    - name: Commit and Push Results
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action Bot"
+        # 只有在文件有变动时才提交，防止报错
+        git add backtest_results.csv
+        git commit -m "自动更新回测排名报告 [skip ci]" || echo "无变动需要提交"
+        git push
