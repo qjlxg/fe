@@ -1,61 +1,65 @@
-name: 07-fund_warning_report_v6.0
+name: 🚀 天枢ETF实战监控系统_V9.0
 
 on:
   push:
     paths:
-      - 'analyzer_V6.py'  # 确保匹配你保存的文件名
+      - 'analyzer_V9.py'        # 建议改为 V9 文件名
       - '.github/workflows/**'
   schedule:
-    # 每天北京时间 15:15 运行（收盘后分析）
+    # 每天北京时间 15:15 运行 (UTC 7:15)
     - cron: '15 7 * * *'
-  workflow_dispatch: 
+  workflow_dispatch:           # 支持手动触发分析
 
 jobs:
-  analyze_funds:
+  trading_system_run:
     env:
       TZ: Asia/Shanghai
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: 📥 拉取最新代码与账本
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: 🐍 配置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip' # 开启缓存加速依赖安装
 
-      - name: Install dependencies
+      - name: 🛠️ 安装量化核心依赖
         run: |
           python -m pip install --upgrade pip
-          # 核心更新：必须安装 akshare 以支持自动数据抓取
           pip install pandas numpy akshare
 
-      - name: Run fund analysis script
-        id: analysis
-        # 确保文件名与你仓库里的一致
-        run: python analyzer_V6.py
+      - name: 📈 执行 V9 核心系统
+        # 注意：这里建议在脚本开头调用我们之前写的 update_etf_data() 函数
+        # 或者直接在这里运行: python data_updater.py && python analyzer_V9.py
+        run: python analyzer_V9.py
 
-      - name: Commit and push changes
-        if: success()
+      - name: 💾 同步账本与报告至仓库
+        if: always() # 即使报错也尝试保存日志，方便排查
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          # 允许添加新生成的数据文件夹和报告
-          git add fund_data/*.csv || true
-          git add *.md || true
-          git add 天枢进阶实战日志.csv || true
+          # 1. 强制添加账本文件，防止持仓丢失
+          git add portfolio.csv || true
           
+          # 2. 添加数据文件夹和日志
+          git add fund_data/*.csv || true
+          git add strategy_log.csv || true
+          git add *.md || true
+          
+          # 检查是否有变动需要提交
           if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes detected. Skipping commit."
+            echo "没有发现数据更新，跳过提交。"
             exit 0
           fi
           
-          git commit -m "📈 [V6.0] 自动行情同步与决策报告: $(date +'%Y-%m-%d %H:%M')"
+          git commit -m "📊 系统自动同步: $(date +'%Y-%m-%d %H:%M') [持仓监控+信号扫描]"
           
-          # 这里的 rebase 是为了防止多个 workflow 并发冲突
+          # 使用 rebase 策略处理潜在的并发冲突
           git pull --rebase origin main
           git push origin main
