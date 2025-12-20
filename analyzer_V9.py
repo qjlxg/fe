@@ -2,7 +2,7 @@ import pandas as pd
 import glob
 import os
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -10,15 +10,27 @@ warnings.filterwarnings('ignore')
 # --- 核心配置 ---
 DATA_DIR = 'fund_data'
 PORTFOLIO_FILE = 'portfolio.csv'
-TRACKER_FILE = 'signal_performance_tracker.csv' # 表现跟踪文件
+TRACKER_FILE = 'signal_performance_tracker.csv' # 历史信号跟踪（用于成功率分析）
 REPORT_FILE = 'README.md'
-MIN_SCORE_THRESHOLD = 3  # 只显示3分及以上的顶级信号
+MARKET_INDEX = '510300'
+MIN_SCORE_SHOW = 3  # 看板仅显示3分及以上信号
+ETF_DD_THRESHOLD = -0.06
 
-# --- 核心逻辑：得分系统 ---
-def analyze_logic_v9(df):
-    if len(df) < 60: return None
+# --- 1. 数据标准化读取 ---
+def load_data(file_path):
+    try:
+        df = pd.read_csv(file_path)
+        mapping = {'日期': 'date', '收盘': 'close', '成交额': 'amount', '最高': 'high', '最低': 'low', '成交量': 'volume'}
+        df.rename(columns=mapping, inplace=True)
+        df.columns = [c.lower() for c in df.columns]
+        df['date'] = pd.to_datetime(df['date'])
+        return df.sort_values('date').reset_index(drop=True)
+    except: return pd.DataFrame()
+
+# --- 2. 深度评分引擎 ---
+def analyze_signal(df):
+    if len(df) < 30: return None
     last = df.iloc[-1]
-    prev = df.iloc[-2]
     
     ma5 = df['close'].rolling(5).mean().iloc[-1]
     ma10 = df['close'].rolling(10).mean().iloc[-1]
@@ -27,87 +39,94 @@ def analyze_logic_v9(df):
     dd = (last['close'] - peak_20) / peak_20
     roc20 = (last['close'] / df['close'].shift(20).iloc[-1]) - 1
 
-    # 1分基础：价格站上5日线且超跌
+    # 评分逻辑
     score = 0
-    if last['close'] > ma5 and dd < -0.06:
+    # 基础门槛：超跌 + 站上5日线
+    if last['close'] > ma5 and dd < ETF_DD_THRESHOLD:
         score = 1
-        # 2分进阶：站上10日线（确认短期趋势转强）
-        if last['close'] > ma10:
-            score += 1
-        # 3分爆发：今日成交额超过5日平均额（确认主力入场）
-        if last['amount'] > amt_ma5:
-            score += 1
+        # 2分：确认短期趋势（站上10日线）
+        if last['close'] > ma10: score += 1
+        # 3分：确认主力异动（今日成交额 > 5日平均）
+        if last['amount'] > amt_ma5: score += 1
             
-    if score >= 1: # 内部记录所有信号，但前端只展示高分
+    if score >= 1:
         return {
             'roc': roc20 * 100,
             'score': score,
             'price': last['close'],
-            'stop': ma10 * 0.96,
+            'stop': ma10 * 0.97, # 建议止损位
             'date': datetime.now().strftime('%Y-%m-%d')
         }
     return None
 
-# --- 历史表现分析模块 ---
-def update_performance_tracker(new_signals):
-    """
-    记录每个信号出现后的表现。
-    逻辑：将今日信号存入 tracker，并检查旧信号在 5 天后的价格。
-    """
-    if not os.path.exists(TRACKER_FILE):
-        df = pd.DataFrame(columns=['date', 'code', 'signal_price', 'score', 'price_5d', 'perf_5d'])
+# --- 3. 历史信号记录模块 ---
+def update_tracker(signals):
+    if not signals: return
+    new_df = pd.DataFrame(signals)
+    if os.path.exists(TRACKER_FILE):
+        old_df = pd.read_csv(TRACKER_FILE)
+        # 避免同日期重复记录
+        combined = pd.concat([old_df, new_df]).drop_duplicates(subset=['date', 'code'])
+        combined.to_csv(TRACKER_FILE, index=False, encoding='utf_8_sig')
     else:
-        df = pd.read_csv(TRACKER_FILE)
+        new_df.to_csv(TRACKER_FILE, index=False, encoding='utf_8_sig')
 
-    # 1. 存入今日新信号
-    new_rows = []
-    for s in new_signals:
-        # 如果该标的今日已记录则跳过
-        if not ((df['date'] == s['date']) & (df['code'] == s['code'])).any():
-            new_rows.append({
-                'date': s['date'], 'code': s['code'], 
-                'signal_price': s['price'], 'score': s['score']
-            })
-    
-    if new_rows:
-        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-
-    # 2. (可选) 这里可以加入自动回溯逻辑，但 Actions 只能看到当前数据
-    # 建议每周你下载这个 CSV 用 Excel 拉一下涨跌幅
-    df.to_csv(TRACKER_FILE, index=False, encoding='utf_8_sig')
-
-# --- 执行与报告 ---
+# --- 4. 执行主流程 ---
 def execute():
+    # A. 扫描数据
     files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     all_signals = []
     
+    # 市场情绪
+    mkt_df = load_data(os.path.join(DATA_DIR, f"{MARKET_INDEX}.csv"))
+    mkt_bias = (mkt_df['close'].iloc[-1] / mkt_df['close'].rolling(20).mean().iloc[-1] - 1) if not mkt_df.empty else 0
+
     for f in files:
         code = os.path.splitext(os.path.basename(f))[0]
-        res = analyze_logic_v9(pd.read_csv(f)) # 简化读取
+        if code == MARKET_INDEX: continue
+        res = analyze_signal(load_data(f))
         if res:
             res['code'] = code
             all_signals.append(res)
 
-    # 保存所有信号到历史记录（用于分析）
-    update_performance_tracker(all_signals)
+    # B. 更新历史跟踪表 (记录 1,2,3 分所有信号)
+    update_tracker(all_signals)
 
-    # 过滤精英信号（用于展示）
-    elite_signals = [s for s in all_signals if s['score'] >= MIN_SCORE_THRESHOLD]
+    # C. 筛选精英信号 (仅展示 3 分)
+    elite_signals = [s for s in all_signals if s['score'] >= MIN_SCORE_SHOW]
     elite_signals.sort(key=lambda x: x['roc'], reverse=True)
 
-    # 写入 README
+    # D. 处理持仓对账 (如有)
+    holdings_md = "> 🧊 空仓中。可在 `portfolio.csv` 手动录入记录。"
+    if os.path.exists(PORTFOLIO_FILE):
+        port = pd.read_csv(PORTFOLIO_FILE)
+        if not port.empty:
+            holdings_md = "| 代码 | 买入价 | 现价 | 盈亏% |\n| --- | --- | --- | --- |\n"
+            for _, row in port.iterrows():
+                f_path = os.path.join(DATA_DIR, f"{row['code']}.csv")
+                if os.path.exists(f_path):
+                    last_c = pd.read_csv(f_path).iloc[-1]['收盘']
+                    profit = (last_c - row['buy_price']) / row['buy_price'] * 100
+                    holdings_md += f"| {row['code']} | {row['buy_price']:.3f} | {last_c:.3f} | {profit:+.2f}% |\n"
+
+    # E. 写入 README 看板
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write("# 🛰️ 天枢 ETF 精英看板 (≥3分信号)\n\n")
-        f.write(f"更新时间: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n")
+        f.write(f"# 🛰️ 天枢 ETF 精英监控看板\n\n")
+        f.write(f"最后同步: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n")
+        f.write(f"### 📊 市场底色\n- **大盘偏离度 (Bias20)**: `{mkt_bias:.2%}`\n")
+        f.write(f"- **风控建议**: {'🟢 积极探路' if mkt_bias > -0.01 else '🟡 严格止损'}\n\n")
         
+        f.write(f"### 💰 实时持仓监控\n{holdings_md}\n\n")
+        
+        f.write(f"### 🎯 精英入场信号 (得分 ≥ {MIN_SCORE_SHOW})\n")
         if elite_signals:
-            f.write("| 排名 | 代码 | 得分 | ROC20% | 现价 | 建议止损 |\n| --- | --- | --- | --- | --- | --- |\n")
-            for i, s in enumerate(elite_signals, 1):
-                f.write(f"| {i} | {s['code']} | 🔥 {s['score']} | {s['roc']:.2f}% | {s['price']:.3f} | {s['stop']:.3f} |\n")
+            f.write("| 代码 | ROC20% | 得分 | 现价 | 建议止损 |\n| --- | --- | --- | --- | --- |\n")
+            for s in elite_signals:
+                f.write(f"| {s['code']} | {s['roc']:.2f}% | 🔥 {s['score']} | {s['price']:.3f} | {s['stop']:.3f} |\n")
         else:
-            f.write("> 🧊 今日无 3 分共振信号。市场处于弱势磨底或单边下跌中，建议持币观望。\n")
-        
-        f.write(f"\n---\n💡 **历史回溯**: 脚本已将所有 1-3 分信号存入 `signal_performance_tracker.csv`。你可以每周下载此文件，对比信号发出 5 天后的表现，从而微调止损阈值或评分逻辑。")
+            f.write("> 😴 今日暂无 3 分共振信号。1-2 分潜在信号已存入后台 `signal_performance_tracker.csv`。\n")
+            
+        f.write("\n---\n*注：历史所有信号及后续表现请下载分析 `signal_performance_tracker.csv`。*")
 
 if __name__ == "__main__":
     execute()
