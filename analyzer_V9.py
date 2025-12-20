@@ -2,7 +2,7 @@ import pandas as pd
 import glob
 import os
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -16,20 +16,37 @@ REPORT_FILE = 'README.md'
 MARKET_INDEX = '510300'
 MIN_SCORE_SHOW = 3
 
-# --- 1. 增强型数据读取：匹配名称与行业 ---
-def get_fund_info():
-    """从网络或静态数据获取基金名称及行业信息"""
+# --- 工具：北京时间转换 ---
+def get_beijing_time():
+    # GitHub Actions 默认是 UTC，需加 8 小时
+    return datetime.utcnow() + timedelta(hours=8)
+
+# --- 工具：行业主题匹配引擎 ---
+def get_fund_tag(code, name):
+    """基于名称关键词自动分类"""
+    tags = {
+        "医疗": ["医", "药", "生物"],
+        "半导体": ["芯", "半导体"],
+        "互联网": ["网", "互联"],
+        "新能源": ["碳", "能", "光伏", "电"],
+        "消费": ["酒", "消", "食"],
+        "宽基": ["1000", "500", "300", "50", "创业板"]
+    }
+    for tag, keys in tags.items():
+        if any(k in name for k in keys):
+            return tag
+    return "其他主题"
+
+def get_fund_info_map():
+    """实时获取全量ETF名称映射"""
     try:
         import akshare as ak
-        # 获取全量ETF基础信息
         fund_info = ak.fund_etf_category_sina("ETF基金")
-        # 建立 基金代码 -> (名称) 映射
-        name_map = dict(zip(fund_info['代码'], fund_info['名称']))
-        return name_map
+        return dict(zip(fund_info['代码'], fund_info['名称']))
     except:
-        # 备用映射：如果网络失败，常用代码手动映射
-        return {"513060": "恒生医疗ETF", "513780": "港股互联网ETF", "159102": "中证1000ETF"}
+        return {}
 
+# --- 1. 数据标准化读取 ---
 def load_data(file_path):
     try:
         df = pd.read_csv(file_path)
@@ -40,7 +57,7 @@ def load_data(file_path):
         return df.sort_values('date').reset_index(drop=True)
     except: return pd.DataFrame()
 
-# --- 2. 评分与分析引擎 ---
+# --- 2. 评分引擎 ---
 def analyze_signal(df):
     if len(df) < 30: return None
     last = df.iloc[-1]
@@ -58,67 +75,75 @@ def analyze_signal(df):
         if last['amount'] > amt_ma5: score += 1
             
     if score >= 1:
-        # 智能仓位：每笔交易风险控制在总资金的 2%
+        # 建议买入股数（单笔风险 2%）
         risk_per_trade = TOTAL_CAPITAL * 0.02
-        stop_gap = last['close'] - (ma10 * 0.97)
-        suggest_shares = int(risk_per_trade / max(stop_gap, 0.01) // 100 * 100)
-        
+        stop_gap = max(last['close'] - (ma10 * 0.97), 0.01)
+        shares = int(risk_per_trade / stop_gap // 100 * 100)
         return {
-            'roc': roc20 * 100,
-            'score': score,
-            'price': last['close'],
-            'stop': ma10 * 0.97,
-            'shares': suggest_shares,
-            'date': datetime.now().strftime('%Y-%m-%d')
+            'roc': roc20 * 100, 'score': score, 'price': last['close'],
+            'stop': ma10 * 0.97, 'shares': shares,
+            'date': get_beijing_time().strftime('%Y-%m-%d')
         }
     return None
 
-# --- 3. 执行并输出 ---
+# --- 3. 执行主流程 ---
 def execute():
-    # 获取名称字典
-    name_map = get_fund_info()
-    
+    bj_time = get_beijing_time()
+    name_map = get_fund_info_map()
     files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     all_signals = []
     
+    # 大盘偏离度
+    mkt_df = load_data(os.path.join(DATA_DIR, f"{MARKET_INDEX}.csv"))
+    mkt_bias = (mkt_df['close'].iloc[-1] / mkt_df['close'].rolling(20).mean().iloc[-1] - 1) if not mkt_df.empty else 0
+
     for f in files:
         code = os.path.splitext(os.path.basename(f))[0]
+        if code == MARKET_INDEX: continue
         res = analyze_signal(load_data(f))
         if res:
             res['code'] = code
-            # 匹配名称和行业标签（根据名称关键字简单分类）
-            name = name_map.get(code, "未知ETF")
-            res['name'] = name
-            res['tag'] = "医疗/医药" if "医" in name else "互联网/科技" if "网" in name or "科技" in name else "宽基/其他"
+            res['name'] = name_map.get(code, "未知名称")
+            res['tag'] = get_fund_tag(code, res['name'])
             all_signals.append(res)
 
-    # 更新历史记录
-    pd.DataFrame(all_signals).to_csv(TRACKER_FILE, index=False, mode='a', header=not os.path.exists(TRACKER_FILE))
+    # 存入历史记录
+    if all_signals:
+        df_new = pd.DataFrame(all_signals)
+        df_new.to_csv(TRACKER_FILE, index=False, mode='a', header=not os.path.exists(TRACKER_FILE))
 
-    # 筛选 ≥3 分精英信号
+    # 过滤 ≥3 分信号
     elite = [s for s in all_signals if s['score'] >= MIN_SCORE_SHOW]
     elite.sort(key=lambda x: x['roc'], reverse=True)
 
-    # 写入 README
+    # 处理持仓
+    holdings_md = "> 🧊 空仓中。"
+    if os.path.exists(PORTFOLIO_FILE):
+        port = pd.read_csv(PORTFOLIO_FILE)
+        if not port.empty:
+            holdings_md = "| 代码 | 基金简称 | 买入价 | 现价 | 盈亏% |\n| --- | --- | --- | --- | --- |\n"
+            for _, row in port.iterrows():
+                f_path = os.path.join(DATA_DIR, f"{row['code']}.csv")
+                if os.path.exists(f_path):
+                    last_c = pd.read_csv(f_path).iloc[-1]['收盘']
+                    name = name_map.get(str(row['code']), "未知")
+                    profit = (last_c - row['buy_price']) / row['buy_price'] * 100
+                    holdings_md += f"| {row['code']} | {name} | {row['buy_price']:.3f} | {last_c:.3f} | {profit:+.2f}% |\n"
+
+    # 生成看板
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write("# 🛰️ 天枢 ETF 精英监控看板 (V10.0)\n\n")
-        f.write(f"更新时间: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n")
-        
-        f.write("## 🎯 顶级入场信号 (得分=3, 价格+趋势+资金共振)\n")
+        f.write(f"# 🛰️ 天枢 ETF 精英看板\n\n")
+        f.write(f"最后同步 (北京时间): `{bj_time.strftime('%Y-%m-%d %H:%M')}`\n\n")
+        f.write(f"### 📊 市场底色\n- 大盘偏离度 (Bias20): `{mkt_bias:.2%}`\n")
+        f.write(f"- 风控建议: {'🟢 积极探路' if mkt_bias > -0.01 else '🟡 严格止损'}\n\n")
+        f.write(f"### 💰 实时持仓监控\n{holdings_md}\n\n")
+        f.write(f"### 🎯 精英入场信号 (得分 ≥ {MIN_SCORE_SHOW})\n")
         if elite:
-            f.write("| 排名 | 代码 | 基金简称 | 主题标签 | ROC20% | 现价 | 建议买入 | 建议止损 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
-            for i, s in enumerate(elite, 1):
-                f.write(f"| {i} | {s['code']} | **{s['name']}** | `{s['tag']}` | {s['roc']:.2f}% | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
+            f.write("| 代码 | 基金简称 | 主题行业 | ROC20% | 得分 | 现价 | 建议买入 | 建议止损 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            for s in elite:
+                f.write(f"| {s['code']} | {s['name']} | `{s['tag']}` | {s['roc']:.2f}% | 🔥 {s['score']} | {s['price']:.3f} | {s['shares']}股 | {s['stop']:.3f} |\n")
         else:
-            f.write("> 🧊 今日暂无 3 分信号。请关注 `tracker` 文件中的 1-2 分备选品种。\n")
-
-        f.write("\n## 📊 板块异动统计\n")
-        if all_signals:
-            tag_counts = pd.DataFrame(all_signals)['tag'].value_counts()
-            for tag, count in tag_counts.items():
-                f.write(f"- `{tag}` 板块今日触发信号数量: **{count}**\n")
-
-    print(f"✨ V10.0 运行完成，看板已同步。")
+            f.write("> 😴 今日暂无 3 分信号。")
 
 if __name__ == "__main__":
     execute()
