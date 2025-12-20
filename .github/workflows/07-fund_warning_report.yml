@@ -1,43 +1,65 @@
-name: 🚀 自动同步分析看板
+name: 🛰️ 天
 
 on:
+  push:
+    paths:
+      - 'analyzer_V9.py'        # 当你修改脚本时触发
+      - '.github/workflows/**'  # 当你修改此配置时触发
   schedule:
-    - cron: '30 7 * * *'  # 每日 15:30
-  workflow_dispatch: 
+    # 每天北京时间 15:35 运行（收盘后分析并更新看板）
+    # UTC 时间 07:35 等于北京时间 15:35
+    - cron: '35 7 * * *'
+  workflow_dispatch:           # 支持手动点击运行按钮
 
 jobs:
-  build:
+  run-and-push:
     runs-on: ubuntu-latest
-    permissions: # 关键：授予写入权限
+    
+    # 关键设置：授予 Actions 写入仓库的权限
+    permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: true # 保持登录状态
 
-      - name: Setup Python
+    steps:
+      - name: 📥 1. 拉取仓库代码
+        uses: actions/checkout@v4
+        with:
+          # 必须设置为 0 以获取所有历史记录，保证 pull --rebase 正常
+          fetch-depth: 0
+
+      - name: 🐍 2. 安装 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Run Analyzer
+      - name: 🛠️ 3. 安装依赖库
         run: |
+          python -m pip install --upgrade pip
           pip install pandas numpy
-          python analyzer_V9.py
 
-      - name: Commit and Push Changes
+      - name: 📈 4. 运行分析脚本
+        run: python analyzer_V9.py
+
+      - name: 💾 5. 将分析结果推送回目录
         run: |
-          git config --global user.name "Sky-Pivot-Bot"
+          # 配置 Git 机器人信息
+          git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           
-          # 添加生成的文件
-          git add README.md strategy_log.csv portfolio.csv || true
+          # 强制将结果文件加入暂存区
+          # 如果你的脚本生成了新的日志或看板，这里会捕获到
+          git add README.md || true
+          git add portfolio.csv || true
+          git add trade_log.csv || true
           
-          # 检查是否有变动
+          # 检查是否有文件发生了变化
           if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes to commit"
+            echo "📢 没有检测到分析结果更新，跳过推送。"
             exit 0
           fi
           
-          git commit -m "📈 自动更新看板与日志: $(date +'%Y-%m-%d %H:%M')"
+          # 提交更改
+          git commit -m "📈 [自动更新] 天枢看板与实战记录: $(date +'%Y-%m-%d %H:%M')"
+          
+          # 关键：先拉取远程改动防止冲突，再推送
+          git pull --rebase origin main
           git push origin main
