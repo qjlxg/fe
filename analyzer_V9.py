@@ -11,94 +11,119 @@ warnings.filterwarnings('ignore')
 DATA_DIR = 'fund_data'
 PORTFOLIO_FILE = 'portfolio.csv'
 REPORT_FILE = 'README.md'
-LOG_FILE = 'trade_signals_history.csv' # 历史记录
+LOG_FILE = 'trade_log.csv'
 MARKET_INDEX = '510300'
-MAX_HOLD_COUNT = 5
+MIN_DAILY_AMOUNT = 50000000 
 ETF_DD_THRESHOLD = -0.06
 
+# --- 1. 标准化读取 ---
 def load_data(file_path):
     try:
         df = pd.read_csv(file_path)
-        # 自动识别中文列名
-        mapping = {'日期': 'date', '收盘': 'close', '成交额': 'amount', '最高': 'high', '最低': 'low'}
+        mapping = {'日期': 'date', '收盘': 'close', '成交额': 'amount', '最高': 'high', '最低': 'low', '成交量': 'volume'}
         df.rename(columns=mapping, inplace=True)
         df.columns = [c.lower() for c in df.columns]
         df['date'] = pd.to_datetime(df['date'])
         return df.sort_values('date').reset_index(drop=True)
     except: return pd.DataFrame()
 
-def analyze_logic(df):
+# --- 2. 策略引擎 ---
+def analyze_etf(df):
     if len(df) < 30: return None
     last = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # 指标计算
+    # 基础指标
     ma5 = df['close'].rolling(5).mean().iloc[-1]
     ma10 = df['close'].rolling(10).mean().iloc[-1]
     peak_20 = df['close'].rolling(20).max().iloc[-1]
-    dd = (last['close'] - peak_20) / peak_20
-    roc20 = df['close'].pct_change(20).iloc[-1]
+    drawdown = (last['close'] - peak_20) / peak_20
+    roc20 = (last['close'] / df['close'].shift(20).iloc[-1]) - 1
     
-    # 筛选条件
-    cond_price = last['close'] > ma5
-    cond_dd = dd < ETF_DD_THRESHOLD
-    
-    if cond_price and cond_dd:
-        # 简单评分：站上10日线加1分，成交量放大加1分
+    # 筛选逻辑：超跌 + 站上5日线 + 流动性
+    if last['close'] > ma5 and drawdown < ETF_DD_THRESHOLD and last['amount'] > MIN_DAILY_AMOUNT:
+        # 评分系统
         score = 1
-        if last['close'] > ma10: score += 1
-        if last['amount'] > df['amount'].rolling(5).mean().iloc[-1]: score += 1
+        if last['close'] > ma10: score += 1 # 站上10日线更稳
+        if last['amount'] > df['amount'].rolling(5).mean().iloc[-1]: score += 1 # 放量企稳
+        
+        # 建议止损位 (ATR简易版：10日线下3%)
+        stop_loss = ma10 * 0.97
         
         return {
             'roc': roc20 * 100,
             'score': score,
             'price': last['close'],
-            'stop': ma10 * 0.96 # 建议止损设在10日线下4%
+            'stop': stop_loss,
+            'amount': last['amount']
         }
     return None
 
-def execute_system():
-    # 1. 扫描
+# --- 3. 持仓对账 ---
+def monitor_portfolio(portfolio, data_dir):
+    hold_results = []
+    for _, row in portfolio.iterrows():
+        code = str(row['code'])
+        f_path = os.path.join(data_dir, f"{code}.csv")
+        if os.path.exists(f_path):
+            df = load_data(f_path)
+            last_price = df['close'].iloc[-1]
+            profit = (last_price - row['buy_price']) / row['buy_price'] * 100
+            ma10 = df['close'].rolling(10).mean().iloc[-1]
+            
+            status = "✅ 正常"
+            if last_price < row['stop_price']: status = "🚨 破位止损"
+            elif last_price < ma10: status = "⚠️ 警示(破10日线)"
+            
+            hold_results.append({
+                'code': code, 'buy_price': row['buy_price'],
+                'current': last_price, 'profit': profit, 'status': status
+            })
+    return hold_results
+
+# --- 4. 主程序：生成看板并推送 ---
+def execute():
+    # A. 扫描新信号
     files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     signals = []
-    
-    # 获取大盘情绪 (Bias)
-    mkt_df = load_data(os.path.join(DATA_DIR, f"{MARKET_INDEX}.csv"))
-    mkt_bias = (mkt_df['close'].iloc[-1] / mkt_df['close'].rolling(20).mean().iloc[-1] - 1)
-
     for f in files:
         code = os.path.splitext(os.path.basename(f))[0]
         if code == MARKET_INDEX: continue
-        res = analyze_logic(load_data(f))
+        res = analyze_etf(load_data(f))
         if res:
             res['code'] = code
             signals.append(res)
-
-    # 2. 排序
+    
     signals.sort(key=lambda x: x['roc'], reverse=True)
-    top_signals = signals[:10]
+    
+    # B. 处理持仓
+    if not os.path.exists(PORTFOLIO_FILE):
+        pd.DataFrame(columns=['code', 'buy_price', 'stop_price']).to_csv(PORTFOLIO_FILE, index=False)
+    portfolio = pd.read_csv(PORTFOLIO_FILE)
+    holdings = monitor_portfolio(portfolio, DATA_DIR)
 
-    # 3. 写入 README.md (推送至 GitHub 目录)
+    # C. 写入 README.md 看板
     with open(REPORT_FILE, "w", encoding="utf_8_sig") as f:
-        f.write("# 🛰️ 天枢 ETF 监控系统\n\n")
-        f.write(f"更新时间: `{datetime.now().strftime('%Y-%m-%d %H:%M')}` (北京时间)\n\n")
-        f.write(f"### 📊 市场背景\n- **大盘偏离度 (Bias)**: `{mkt_bias:.2%}`\n")
-        f.write(f"- **操作建议**: {'🚨 保持谨慎' if mkt_bias < -0.02 else '✅ 分批建仓'}\n\n")
+        f.write("# 🚀 天枢 ETF 量化监控中心\n\n")
+        f.write(f"更新时间: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n")
         
-        f.write("### 🎯 推荐关注列表 (入场参考)\n")
-        f.write("| 代码 | ROC20% | 得分 | 现价 | 建议止损 |\n| --- | --- | --- | --- | --- |\n")
-        for s in top_signals:
-            f.write(f"| {s['code']} | {s['roc']:.2f}% | {s['score']} | {s['price']:.3f} | {s['stop']:.3f} |\n")
-        
-        f.write(f"\n> 💡 **说明**: 列表按强度排序。得分越高说明共振越强。")
+        f.write("## 💰 当前持仓监控\n")
+        if holdings:
+            f.write("| 代码 | 买入价 | 现价 | 盈亏 | 状态建议 |\n| --- | --- | --- | --- | --- |\n")
+            for h in holdings:
+                f.write(f"| {h['code']} | {h['buy_price']:.3f} | {h['current']:.3f} | {h['profit']:+.2f}% | {h['status']} |\n")
+        else:
+            f.write("> 🧊 目前空仓。请在 `portfolio.csv` 中手动录入买入记录。\n")
 
-    # 4. 写入历史记录 CSV
-    history_df = pd.DataFrame(top_signals)
-    history_df['date'] = datetime.now().strftime('%Y-%m-%d')
-    header = not os.path.exists(LOG_FILE)
-    history_df.to_csv(LOG_FILE, mode='a', index=False, header=header, encoding='utf_8_sig')
+        f.write("\n## 🎯 入场信号 (超跌共振扫描)\n")
+        if signals:
+            f.write("| 排名 | 代码 | ROC20% | 得分 | 现价 | 建议止损 |\n| --- | --- | --- | --- | --- | --- |\n")
+            for i, s in enumerate(signals[:10], 1):
+                f.write(f"| {i} | {s['code']} | {s['roc']:.2f}% | {s['score']} | {s['price']:.3f} | {s['stop']:.3f} |\n")
+        else:
+            f.write("> 😴 市场全线低迷，未发现符合条件的入场标的。\n")
 
-    print(f"✨ 扫描完成，已生成报告至 {REPORT_FILE} 并更新日志。")
+    print(f"✨ 看板已更新。共发现 {len(signals)} 个信号。")
 
 if __name__ == "__main__":
-    execute_system()
+    execute()
