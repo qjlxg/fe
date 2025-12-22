@@ -5,13 +5,9 @@ on:
     paths:
       - 'etf_backtest_master.py'
       - '.github/workflows/backtest_workflow.yml'
-    branches: [ main ]
   workflow_dispatch:
   schedule:
     - cron: '0 10 * * *'
-
-env:
-  TZ: Asia/Shanghai
 
 jobs:
   run_backtest:
@@ -20,40 +16,34 @@ jobs:
       contents: write
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
+    - name: 📥 1. 拉取代码
+      uses: actions/checkout@v4
       with:
-        # 必须拉取历史记录，否则无法进行 rebase
         fetch-depth: 0 
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - name: 🐍 2. 设置 Python
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.9'
+        python-version: '3.10'
 
-    - name: Install Dependencies
-      run: |
-        pip install backtrader pandas
+    - name: 🛠️ 3. 安装依赖
+      run: pip install backtrader pandas
 
-    - name: Execute Parallel Backtest
-      run: |
-        # 脚本名称统一为 etf_backtest_master.py
-        python etf_backtest_master.py
+    - name: ⚙️ 4. 执行回测脚本
+      run: python etf_backtest_master.py
 
-    - name: Commit and Push Results
+    - name: 💾 5. 提交并推送结果
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action Bot"
         
-        # 统一结果文件名，如果有旧的 filtered 文件也一并添加
-        git add backtest_results.csv 
-        
-        # 提交变动
-        git commit -m "自动更新回测排名报告 [skip ci]" || echo "无变动需要提交"
-        
-        # --- 核心修复：解决你遇到的 Rejected 错误 ---
-        # 尝试拉取远程更新并进行变基，解决并发冲突
-        git pull origin main --rebase
-        
-        # 推送到远程
-        git push origin main
+        # 必须确保文件名与 Python 脚本输出一致
+        if [ -f "backtest_results.csv" ]; then
+          git add backtest_results.csv
+          git commit -m "📊 自动更新回测排名报告 [skip ci]" || echo "无变动需要提交"
+          git pull origin main --rebase
+          git push origin main
+        else
+          echo "❌ 错误：未发现回测结果文件，请检查 Python 日志"
+          exit 1
+        fi
