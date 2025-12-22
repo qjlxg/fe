@@ -4,10 +4,11 @@ import os
 import glob
 from datetime import datetime, timedelta
 
-# --- 核心配置 (请确保文件名与你仓库一致) ---
+# --- 核心配置 ---
 DATA_DIR = 'fund_data'
 HISTORY_FILE = 'signal_history.csv'     
 BACKTEST_REPORT = 'backtest_results.csv'
+# 修改点：指向 Excel 文件
 NAME_LIST_FILE = 'ETF列表.xlsx'
 BENCHMARK_CODE = '510300'
 
@@ -18,18 +19,22 @@ def get_beijing_time():
 def analyze():
     print(f"🚀 启动 V12-Elite 分析系统... {get_beijing_time()}")
 
-    # 1. 加载名称映射表 (从源头解决名称显示问题)
+    # 1. 加载名称映射表 (从 Excel 源头获取名称)
     name_map = {}
     if os.path.exists(NAME_LIST_FILE):
         try:
-            df_n = pd.read_csv(NAME_LIST_FILE, dtype={'证券代码': str})
-            # 去除代码和简称的空格
+            # 修改点：使用 read_excel 读取，并强制将代码转为字符串防止 0 丢失
+            df_n = pd.read_excel(NAME_LIST_FILE, dtype={'证券代码': str})
+            # 清洗数据：去除空格
             df_n['证券代码'] = df_n['证券代码'].str.strip()
             df_n['证券简称'] = df_n['证券简称'].str.strip()
+            # 建立映射字典
             name_map = dict(zip(df_n['证券代码'], df_n['证券简称']))
-            print(f"✅ 成功映射 {len(name_map)} 个基金名称")
+            print(f"✅ 成功从 Excel 映射 {len(name_map)} 个基金名称")
         except Exception as e:
-            print(f"⚠️ 名称映射表加载失败: {e}")
+            print(f"⚠️ 名称映射表加载失败 (请确保已安装 openpyxl): {e}")
+    else:
+        print(f"⚠️ 未找到名称列表文件: {NAME_LIST_FILE}")
 
     # 2. 加载精英池 (回测前10名)
     elite_pool = []
@@ -63,7 +68,7 @@ def analyze():
 
     for file in target_files:
         code = os.path.basename(file)[:6]
-        if code == BENCHMARK_CODE: continue # 跳过大盘标的本身
+        if code == BENCHMARK_CODE: continue 
         
         try:
             df = pd.read_csv(file)
@@ -81,14 +86,14 @@ def analyze():
             
             # 策略核心：站上MA5 且 40日高位回撤超过4%
             if curr_p > ma5 and dd < -0.04:
-                # 计算ATR止损 (3倍ATR 或 强制7%)
+                # 计算ATR止损
                 tr = np.maximum(df['最高'] - df['最低'], 
                                 np.maximum(abs(df['最高'] - df['收盘'].shift(1)), 
                                            abs(df['最低'] - df['收盘'].shift(1))))
                 atr = tr.rolling(14).mean().iloc[-1]
                 stop_p = min(curr_p - 3.0 * atr, curr_p * 0.93)
                 
-                # 从映射表获取名称，获取不到则用代码
+                # 从 Excel 映射表获取名称
                 real_name = name_map.get(code, f"ETF_{code}")
                 
                 results.append({
@@ -102,8 +107,7 @@ def analyze():
         except:
             continue
 
-    # 5. 精准对齐写入 13 列账本
-    # 账本表头定义
+    # 5. 写入 13 列账本
     header = "date,code,name,entry_price,index,price,stop,rsi,dd,score,lots,pos_pct,turnover\n"
     
     if results and is_safe:
@@ -112,8 +116,6 @@ def analyze():
             if not file_exists:
                 f.write(header)
             for r in results:
-                # 按照 entry_price(第4列) 和 price(第6列) 均填入当前价的逻辑
-                # 后面 3 个空逗号补齐 lots, pos_pct, turnover
                 line = f"{r['date']},{r['code']},{r['name']},{r['price']},index,{r['price']},{r['stop']},0,{r['dd']},4,,,\n"
                 f.write(line)
         print(f"💾 账本已更新，新增 {len(results)} 条记录")
@@ -132,7 +134,6 @@ def analyze():
         if results:
             f.write("| 代码 | 名称 | 现价 | 止损参考 | 40D回撤 | 身份 |\n")
             f.write("| --- | --- | --- | --- | --- | --- |\n")
-            # 排序：精英在前
             results_sorted = sorted(results, key=lambda x: x['code'] in elite_pool, reverse=True)
             for r in results_sorted:
                 tag = "🏆精英" if r['code'] in elite_pool else "⚪普通"
