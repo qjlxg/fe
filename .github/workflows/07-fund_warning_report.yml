@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'analyzer_V12.py'
+      - '.github/workflows/07-fund_warning_report.yml'
   schedule:
     - cron: '55 6 * * *' # 北京时间 14:55 运行
   workflow_dispatch: 
@@ -11,13 +12,16 @@ on:
 jobs:
   run_analysis:
     runs-on: ubuntu-latest
-    # 关键：必须给 Actions 写入权限，否则无法更新 signal_history.csv
+    # 必须给 Actions 写入权限，否则无法更新仓库文件
     permissions:
       contents: write
       
     steps:
       - name: 📥 1. 拉取仓库
         uses: actions/checkout@v4
+        with:
+          # 取消浅克隆，确保 pull --rebase 有足够的历史记录进行合并
+          fetch-depth: 0
 
       - name: 🐍 2. 初始化 Python
         uses: actions/setup-python@v5
@@ -31,11 +35,24 @@ jobs:
         # 确保这里的文件名和你最新的 Python 脚本名一致
         run: python analyzer_V12.py
 
-      - name: 💾 5. 保存结果与历史账本
+      - name: 💾 5. 保存结果与历史账本 (修复 Push 冲突)
         run: |
           git config --global user.name "Quant-Bot"
           git config --global user.email "bot@quant.com"
-          # 关键：这里要把 csv 文件也加入追踪
-          git add README.md signal_history.csv
-          git commit -m "📊 绩效看板与历史数据更新: $(date +'%Y-%m-%d %H:%M')" || echo "No changes"
-          git push
+          
+          # 检查文件是否存在并添加
+          git add README.md signal_history.csv || echo "部分文件未生成"
+          
+          # 只有在有变动时才提交，避免产生空 commit 的错误
+          if git diff --cached --quiet; then
+            echo "没有发现变动，跳过推送。"
+          else
+            git commit -m "📊 绩效看板与历史数据更新: $(date +'%Y-%m-%d %H:%M')"
+            
+            # 【核心修复】：推送前强制拉取远程变动并以 rebase 方式合并
+            # 即使你在网页端修改了 README，或者其他 Action 运行过，这里也能自动处理
+            git pull --rebase origin main
+            
+            # 推送回 main 分支
+            git push origin main
+          fi
