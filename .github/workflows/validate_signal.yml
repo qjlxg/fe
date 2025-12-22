@@ -1,15 +1,18 @@
 name: Signal Validation Workflow
 
 on:
-  # 紧随回测流程之后运行，或者每天定时运行
-  workflow_run:
-    workflows: ["Parallel ETF Backtest Workflow"]
-    types:
-      - completed
-  workflow_dispatch: # 支持手动运行
+  push:
+    paths:
+      - 'signal_validator.py'
+      - '.github/workflows/validate_signal.yml'
+    branches: [ main ]
+  workflow_dispatch: # 支持手动触发
+
+env:
+  TZ: Asia/Shanghai
 
 jobs:
-  validate:
+  validate_job:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,21 +20,31 @@ jobs:
     steps:
     - name: Checkout Code
       uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
 
-    - name: Run Validation
-      run: |
-        python signal_validator.py
+    - name: Install Dependencies
+      run: pip install pandas
 
-    - name: Update Report
+    - name: Run Validation Script
+      run: python signal_validator.py
+
+    - name: Commit and Push Report
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action Bot"
+        
+        # 检查是否有文件变动
         git add VALIDATION_REPORT.md
-        git commit -m "自动更新信号校验报告 [skip ci]" || echo "无变动"
-        git pull origin main --rebase
-        git push origin main
+        if git diff --cached --quiet; then
+          echo "没有新变动，跳过推送。"
+        else
+          git commit -m "自动更新校验报告 (上海时区) [skip ci]"
+          git pull origin main --rebase
+          git push origin main
+        fi
