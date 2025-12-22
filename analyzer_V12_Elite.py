@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 DATA_DIR = 'fund_data'
 HISTORY_FILE = 'signal_history.csv'     
 BACKTEST_REPORT = 'backtest_results.csv'
-NAME_LIST_FILE = 'ETF列表.xlsx.csv'
+NAME_LIST_FILE = 'ETF列表.xlsx'
 BENCHMARK_CODE = '510300'
 
 def get_beijing_time():
