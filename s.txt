@@ -1,0 +1,4 @@
+三个脚本的协作流程（闭环）
+1. 回测脚本 更新 backtest_results.csv优化你的选股池。
+2. 分析脚本 参考选股池  发出信号并写入 signal_history.csv。
+3. 校验脚本 读取 signal_history.csv 更新 VALIDATION_REPORT.md反馈你的真实战绩。
