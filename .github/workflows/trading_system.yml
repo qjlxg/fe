@@ -1,0 +1,25 @@
+name: 🩺 数据仓库维护 (体检专用)
+
+on:
+  push:
+    paths:
+      - 'fund_data/**'  # 只有当 fund_data 文件夹内的内容变动时才触发
+  workflow_dispatch: 
+
+jobs:
+  health_check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 初始化 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 🛠️ 安装依赖
+        run: pip install pandas
+
+      - name: 🩺 执行数据体检
+        run: python data_health_check.py
