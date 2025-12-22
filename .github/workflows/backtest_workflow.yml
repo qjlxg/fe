@@ -1,4 +1,4 @@
-name: Parallel ETF Backtest Workflow
+name: 001-Parallel ETF Backtest Workflow
 
 on:
   push:
