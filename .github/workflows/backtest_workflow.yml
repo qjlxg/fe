@@ -1,5 +1,4 @@
-name: 001-Parallel ETF Backtest Workflow
-
+name: 001-回测
 on:
   push:
     paths:
