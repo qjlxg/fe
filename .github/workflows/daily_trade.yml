@@ -32,13 +32,7 @@ jobs:
 
       - name: Run Quant Pipeline
         run: |
-          echo "Step 1: 回测排名..."
-          python etf_backtest_master.py
-          echo "Step 2: 扫描信号..."
-          python analyzer_V12_Elite.py
-          echo "Step 3: 盈亏校验..."
-          python signal_validator_v2.py
-          echo "Step 4: 生成行动决策..."
+   
           python summary.py
 
       - name: Commit and Push Results
