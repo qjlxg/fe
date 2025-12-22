@@ -1,12 +1,21 @@
 name: Daily ETF Quant System
 
 on:
+  # 1. 每天北京时间 16:30 自动运行 (UTC 08:30)
   schedule:
-    - cron: '30 8 * * 1-5' # 协调世界时 (UTC) 08:30 是北京时间 16:30
-  workflow_dispatch: # 允许手动点击运行
+    - cron: '30 8 * * 1-5'
+  
+  # 2. 当脚本 (py) 或 工作流 (yml) 发生变动时自动运行
+  push:
+    paths:
+      - '**.py'
+      - '.github/workflows/daily_trade.yml'
+  
+  # 3. 允许在 GitHub Actions 界面手动点击按钮运行
+  workflow_dispatch:
 
 jobs:
-  quant_process:
+  build_and_run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -21,22 +30,21 @@ jobs:
         run: |
           pip install pandas numpy openpyxl lxml
 
-      - name: 1. 执行回测 (锁定精英池)
-        run: python etf_backtest_master.py
+      - name: Run Quant Pipeline
+        run: |
+          echo "Step 1: 回测排名..."
+          python etf_backtest_master.py
+          echo "Step 2: 扫描信号..."
+          python analyzer_V12_Elite.py
+          echo "Step 3: 盈亏校验..."
+          python signal_validator_v2.py
+          echo "Step 4: 生成行动决策..."
+          python summary.py
 
-      - name: 2. 执行分析 (扫描新信号)
-        run: python analyzer_V12_Elite.py
-
-      - name: 3. 执行校验 (盈亏复盘)
-        run: python signal_validator_v2.py
-
-      - name: 4. 生成今日指令
-        run: python summary.py
-
-      - name: 5. 提交结果到仓库
+      - name: Commit and Push Results
         run: |
           git config --global user.name "Quant-Bot"
-          git config --global user.email "bot@github.com"
+          git config --global user.email "actions@github.com"
           git add .
-          git commit -m "Auto Update: $(date +'%Y-%m-%d %H:%M') Reports" || exit 0
-          git push
+          # 只有在文件有变动时才提交，防止工作流因空提交报错
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto Update: $(date +'%Y-%m-%d %H:%M') 北京时间" && git push)
