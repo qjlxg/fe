@@ -1,9 +1,9 @@
-name: 🚀 实盘绩效回溯版 V12
+name: 🚀 002-
 
 on:
   push:
     paths:
-      - 'analyzer_V12.py'
+      - 'analyzer_V12_Elite.py'
       - '.github/workflows/07-fund_warning_report.yml'
   schedule:
     - cron: '55 6 * * *' # 北京时间 14:55 运行
@@ -32,8 +32,8 @@ jobs:
         run: pip install pandas numpy openpyxl
 
       - name: 📈 4. 执行多维分析与胜率追踪
-        # 确保这里的文件名和你最新的 Python 脚本名一致
-        run: python analyzer_V12.py
+       
+        run: python analyzer_V12_Elite.py
 
       - name: 💾 5. 保存结果与历史账本 (修复 Push 冲突)
         run: |
