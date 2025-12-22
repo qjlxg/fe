@@ -1,0 +1,42 @@
+name: Daily ETF Quant System
+
+on:
+  schedule:
+    - cron: '30 8 * * 1-5' # 协调世界时 (UTC) 08:30 是北京时间 16:30
+  workflow_dispatch: # 允许手动点击运行
+
+jobs:
+  quant_process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas numpy openpyxl lxml
+
+      - name: 1. 执行回测 (锁定精英池)
+        run: python etf_backtest_master.py
+
+      - name: 2. 执行分析 (扫描新信号)
+        run: python analyzer_V12_Elite.py
+
+      - name: 3. 执行校验 (盈亏复盘)
+        run: python signal_validator_v2.py
+
+      - name: 4. 生成今日指令
+        run: python summary.py
+
+      - name: 5. 提交结果到仓库
+        run: |
+          git config --global user.name "Quant-Bot"
+          git config --global user.email "bot@github.com"
+          git add .
+          git commit -m "Auto Update: $(date +'%Y-%m-%d %H:%M') Reports" || exit 0
+          git push
