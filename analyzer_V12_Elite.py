@@ -4,30 +4,47 @@ import os
 import glob
 from datetime import datetime, timedelta
 
-# --- 配置 ---
+# --- 核心配置 (请确保文件名与你仓库一致) ---
 DATA_DIR = 'fund_data'
-HISTORY_FILE = 'signal_history.csv'
+HISTORY_FILE = 'signal_history.csv'     
 BACKTEST_REPORT = 'backtest_results.csv'
+NAME_LIST_FILE = 'ETF列表.xlsx.csv'
 BENCHMARK_CODE = '510300'
 
 def get_beijing_time():
+    """获取北京时间用于看板展示"""
     return (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
 
 def analyze():
-    # 1. 加载精选池 (从回测报告取前10名)
+    print(f"🚀 启动 V12-Elite 分析系统... {get_beijing_time()}")
+
+    # 1. 加载名称映射表 (从源头解决名称显示问题)
+    name_map = {}
+    if os.path.exists(NAME_LIST_FILE):
+        try:
+            df_n = pd.read_csv(NAME_LIST_FILE, dtype={'证券代码': str})
+            # 去除代码和简称的空格
+            df_n['证券代码'] = df_n['证券代码'].str.strip()
+            df_n['证券简称'] = df_n['证券简称'].str.strip()
+            name_map = dict(zip(df_n['证券代码'], df_n['证券简称']))
+            print(f"✅ 成功映射 {len(name_map)} 个基金名称")
+        except Exception as e:
+            print(f"⚠️ 名称映射表加载失败: {e}")
+
+    # 2. 加载精英池 (回测前10名)
     elite_pool = []
     if os.path.exists(BACKTEST_REPORT):
         try:
             df_bt = pd.read_csv(BACKTEST_REPORT, dtype={'代码': str})
             elite_pool = df_bt['代码'].head(10).tolist()
-            print(f"✅ 已加载精英池: {elite_pool}")
+            print(f"✅ 精英池已锁定: {elite_pool}")
         except:
-            print("⚠️ 读取回测报告失败，将扫描全量数据")
+            print("⚠️ 未能加载回测报告，所有信号将标为普通")
     
-    # 2. 大盘风控检查 (修正排序逻辑)
+    # 3. 大盘风控逻辑 (基于 510300 MA20)
     bench_file = os.path.join(DATA_DIR, f"{BENCHMARK_CODE}.csv")
-    if not os.path.exists(bench_file):
-        print(f"⚠️ 缺少基准文件 {BENCHMARK_CODE}")
+    if not os.path.exists(bench_file): 
+        print(f"❌ 关键错误: 缺少大盘数据 {bench_file}")
         return
     
     df_b = pd.read_csv(bench_file)
@@ -35,17 +52,19 @@ def analyze():
     df_b['日期'] = pd.to_datetime(df_b['日期'])
     df_b = df_b.sort_values('日期').reset_index(drop=True)
     
-    ma20 = df_b['收盘'].rolling(20).mean().iloc[-1]
     curr_b = df_b['收盘'].iloc[-1]
+    ma20 = df_b['收盘'].rolling(20).mean().iloc[-1]
     is_safe = curr_b >= ma20
-    
-    # 3. 扫描逻辑
+    print(f"🚦 大盘状态: {'安全' if is_safe else '风险'} (现价:{curr_b:.3f} / MA20:{ma20:.3f})")
+
+    # 4. 扫描所有标的产生信号
     results = []
-    # 如果有精英池则只扫精英，没有则扫文件夹下所有
-    target_files = [os.path.join(DATA_DIR, f"{c}.csv") for c in elite_pool] if elite_pool else glob.glob(f"{DATA_DIR}/*.csv")
+    target_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
 
     for file in target_files:
-        if not os.path.exists(file) or BENCHMARK_CODE in file: continue
+        code = os.path.basename(file)[:6]
+        if code == BENCHMARK_CODE: continue # 跳过大盘标的本身
+        
         try:
             df = pd.read_csv(file)
             df.columns = [c.strip() for c in df.columns]
@@ -60,65 +79,68 @@ def analyze():
             hi40 = df['收盘'].rolling(40).max().iloc[-1]
             dd = (curr_p - hi40) / hi40
             
-            # 基础门槛：站上MA5 且 40日回撤 > 4%
+            # 策略核心：站上MA5 且 40日高位回撤超过4%
             if curr_p > ma5 and dd < -0.04:
-                # 辅助评分 (RSI/MACD/成交量等，此处保持你的V12核心算法)
-                score = 1
-                # RSI 简单实现
-                delta = df['收盘'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rsi = 100 - (100 / (1 + (gain/loss).iloc[-1]))
-                if rsi < 40: score += 1
-                
-                # ATR止损
-                tr = np.maximum(df['最高'] - df['最低'], abs(df['最高'] - df['收盘'].shift(1)))
+                # 计算ATR止损 (3倍ATR 或 强制7%)
+                tr = np.maximum(df['最高'] - df['最低'], 
+                                np.maximum(abs(df['最高'] - df['收盘'].shift(1)), 
+                                           abs(df['最低'] - df['收盘'].shift(1))))
                 atr = tr.rolling(14).mean().iloc[-1]
                 stop_p = min(curr_p - 3.0 * atr, curr_p * 0.93)
                 
+                # 从映射表获取名称，获取不到则用代码
+                real_name = name_map.get(code, f"ETF_{code}")
+                
                 results.append({
                     'date': last['日期'].strftime('%Y-%m-%d'),
-                    'code': os.path.basename(file)[:6],
-                    'price': curr_p,
+                    'code': code,
+                    'name': real_name,
+                    'price': round(curr_p, 3),
                     'stop': round(stop_p, 3),
-                    'score': score,
-                    'rsi': round(rsi, 1),
                     'dd': f"{round(dd*100, 2)}%"
                 })
-        except: continue
+        except:
+            continue
 
-    # 4. 账本保护 (不弄丢历史)
+    # 5. 精准对齐写入 13 列账本
+    # 账本表头定义
+    header = "date,code,name,entry_price,index,price,stop,rsi,dd,score,lots,pos_pct,turnover\n"
+    
     if results and is_safe:
-        if not os.path.exists(HISTORY_FILE):
-            # 初始化表头
-            pd.DataFrame(columns=['date','code','name','price','index','entry_price','stop','rsi','dd','score']).to_csv(HISTORY_FILE, index=False)
-        
+        file_exists = os.path.exists(HISTORY_FILE)
         with open(HISTORY_FILE, 'a', encoding='utf_8_sig') as f:
+            if not file_exists:
+                f.write(header)
             for r in results:
-                # 记录信号到账本
-                f.write(f"{r['date']},{r['code']},精英标的,{r['price']},index,{r['price']},{r['stop']},{r['rsi']},{r['dd']},{r['score']}\n")
+                # 按照 entry_price(第4列) 和 price(第6列) 均填入当前价的逻辑
+                # 后面 3 个空逗号补齐 lots, pos_pct, turnover
+                line = f"{r['date']},{r['code']},{r['name']},{r['price']},index,{r['price']},{r['stop']},0,{r['dd']},4,,,\n"
+                f.write(line)
+        print(f"💾 账本已更新，新增 {len(results)} 条记录")
 
-    # 5. 生成完整版 README 看板
+    # 6. 更新 README.md 实时看板
     with open('README.md', 'w', encoding='utf_8_sig') as f:
         f.write(f"# 🏆 精选池实战看板 (V12-Elite)\n\n")
         f.write(f"更新时间: `{get_beijing_time()}`\n\n")
-        
-        status_icon = "✅ 趋势安全" if is_safe else "🛑 避险模式"
-        f.write(f"### 🚦 市场环境: {status_icon}\n")
-        f.write(f"- 510300现价: `{curr_b}` (MA20: `{round(ma20, 3)}`)\n\n")
+        f.write(f"### 🚦 市场环境: {'✅ 趋势安全' if is_safe else '🛑 风险避险'}\n")
+        f.write(f"- 510300 现价: `{curr_b:.3f}` (MA20: `{ma20:.3f}`)\n\n")
         
         if not is_safe:
-            f.write("> 🚩 **当前大盘处于20日线下**：系统已进入防守状态，不建议开新仓。\n")
-        elif not results:
-            f.write("> 🔍 **扫描完毕**：精选池（回测前10名）今日暂无符合超跌反弹的信号。\n")
-        else:
-            f.write("### 🎯 今日推荐入选\n")
-            f.write("| 代码 | 现价 | 止损参考 | 评分 | RSI | 40D回撤 |\n")
+            f.write("> ⚠️ 当前处于风险区域，策略已暂停新信号触发，请关注存量标的止损。\n\n")
+        
+        f.write("### 🎯 今日推荐入选\n")
+        if results:
+            f.write("| 代码 | 名称 | 现价 | 止损参考 | 40D回撤 | 身份 |\n")
             f.write("| --- | --- | --- | --- | --- | --- |\n")
-            for r in sorted(results, key=lambda x: x['score'], reverse=True):
-                f.write(f"| {r['code']} | {r['price']} | {r['stop']} | {r['score']} | {r['rsi']} | {r['dd']} |\n")
+            # 排序：精英在前
+            results_sorted = sorted(results, key=lambda x: x['code'] in elite_pool, reverse=True)
+            for r in results_sorted:
+                tag = "🏆精英" if r['code'] in elite_pool else "⚪普通"
+                f.write(f"| {r['code']} | {r['name']} | {r['price']} | {r['stop']} | {r['dd']} | {tag} |\n")
+        else:
+            f.write("*今日暂无满足筛选条件的标的。*\n")
 
-    print(f"✅ 看板更新完成。今日信号: {len(results)}")
+    print(f"🏁 分析流程结束。")
 
 if __name__ == "__main__":
     analyze()
