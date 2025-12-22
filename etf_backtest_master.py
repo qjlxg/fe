@@ -14,7 +14,7 @@ class ETFDataFeed(bt.feeds.PandasData):
 
 # --- 实战策略 ---
 class MultiFactorStrategy(bt.Strategy):
-    params = (('atr_period', 14), ('atr_dist', 3.0), ('risk_pct', 0.02), ('min_score', 4))
+    params = (('atr_period', 14), ('atr_dist', 3.0), ('risk_pct', 0.02), ('min_score', 1))
 
     def __init__(self):
         self.target = self.datas[0]
