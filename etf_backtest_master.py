@@ -4,113 +4,112 @@ import os
 import glob
 from multiprocessing import Pool, cpu_count
 
-# --- 数据适配：强制去除列名空格 ---
+# --- 1. 定义数据加载格式 ---
 class ETFDataFeed(bt.feeds.PandasData):
     params = (
-        ('datetime', '日期'), ('open', '开盘'), ('high', '最高'),
-        ('low', '最低'), ('close', '收盘'), ('volume', '成交量'),
+        ('datetime', '日期'),
+        ('open', '开盘'),
+        ('high', '最高'),
+        ('low', '最低'),
+        ('close', '收盘'),
+        ('volume', '成交量'),
+        ('openinterest', -1),
     )
 
-# --- 核心策略：完全对齐 analyzer_V12 ---
+# --- 2. 策略核心逻辑 (同步 analyzer_V12) ---
 class SyncStrategy(bt.Strategy):
-    params = (
-        ('atr_period', 14), 
-        ('atr_dist', 3.0),   # 对齐 3.0xATR 止损
-        ('min_score', 4),    # 对齐 4 分门槛
-    )
+    params = (('atr_period', 14), ('atr_dist', 3.0))
 
     def __init__(self):
-        # 1. 指标对齐
         self.ma5 = bt.indicators.SMA(self.data.close, period=5)
         self.hi40 = bt.indicators.Highest(self.data.close, period=40)
         self.atr = bt.indicators.ATR(self.data, period=self.params.atr_period)
-        self.rsi = bt.indicators.RSI(self.data.close, period=14)
-        self.macd = bt.indicators.MACDHisto(self.data.close)
-        
         self.stop_price = None
 
     def next(self):
-        # 2. 止损逻辑：如果已持仓，检测止损
+        # 如果已持仓，检查止损
         if self.position:
             if self.data.close[0] < self.stop_price:
-                self.close(msg="触发止损")
+                self.close()
             return
 
-        # 3. 评分逻辑 (完全复刻分析脚本)
-        dd = (self.data.close[0] - self.hi40[0]) / (self.hi40[0] + 0.00001)
+        # 计算40日回撤
+        dd = (self.data.close[0] - self.hi40[0]) / (self.hi40[0] + 1e-6)
         
-        score = 0
+        # 买入逻辑：站上MA5且超跌 > 4%
         if self.data.close[0] > self.ma5[0] and dd < -0.04:
-            score += 1 # 基础分
-            if self.macd[0] > self.macd[-1]: score += 1
-            if self.rsi[0] < 40: score += 1
-            # 回测中简化换手率逻辑，仅作为得分参考
-            if self.data.volume[0] > bt.indicators.SMA(self.data.volume, period=14)[0]: score += 2
-
-        # 4. 执行买入
-        if score >= self.params.min_score:
-            # 计算 ATR 止损位 (对齐分析脚本算法)
             atr_val = self.atr[0] if self.atr[0] > 0 else self.data.close[0] * 0.02
-            self.stop_price = min(self.data.close[0] - self.params.atr_dist * atr_val, self.data.close[0] * 0.93)
-            
-            # 简单固定仓位模拟
+            # 计算止损位
+            self.stop_price = min(self.data.close[0] - self.params.atr_dist * atr_val, 
+                                  self.data.close[0] * 0.93)
             self.buy(size=100)
 
-def run_backtest(file):
-    code = os.path.basename(file).replace('.csv', '')
+# --- 3. 单个标的回测执行函数 ---
+def run_backtest(file_path):
+    code = os.path.basename(file_path).replace('.csv', '')
     try:
-        df = pd.read_csv(file, parse_dates=['日期'])
+        df = pd.read_csv(file_path)
         df.columns = [c.strip() for c in df.columns]
+        df['日期'] = pd.to_datetime(df['日期'])
+        # 【关键补丁】强制正序排列
+        df = df.sort_values('日期', ascending=True).reset_index(drop=True)
+        
         if len(df) < 50: return None
 
         cerebro = bt.Cerebro()
-        cerebro.broker.set_coc(True) # 允许信号当天成交，对齐分析看板
-        cerebro.broker.setcash(10000.0)
-        cerebro.broker.set_slippage_perc(0.001) # 模拟 0.1% 滑点摩擦
-
-        cerebro.adddata(ETFDataFeed(dataname=df))
         cerebro.addstrategy(SyncStrategy)
         
-        # 5. 加入高级分析器
+        data = ETFDataFeed(dataname=df)
+        cerebro.adddata(data)
+        cerebro.broker.setcash(10000.0) # 模拟你投入的1W元
+        cerebro.broker.set_coc(True)    # 以当日收盘价成交
+
+        # 添加分析器
         cerebro.addanalyzer(bt.analyzers.Returns, _name='ret')
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.02)
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
 
         results = cerebro.run()
-        res = results[0]
-        
-        ann_ret = res.analyzers.ret.get_analysis().get('rnorm100', 0)
-        sharpe = res.analyzers.sharpe.get_analysis().get('sharperatio', 0)
-        max_dd = res.analyzers.dd.get_analysis().get('max', {}).get('drawdown', 0)
+        strat = results[0]
 
-        # 过滤数据异常值
-        if ann_ret > 120 or ann_ret < -50: return None
+        # 获取统计指标
+        ret_info = strat.analyzers.ret.get_analysis()
+        sharpe_info = strat.analyzers.sharpe.get_analysis()
+        dd_info = strat.analyzers.dd.get_analysis()
+
+        ann_ret = ret_info.get('rnorm100', 0)
+        sharpe = sharpe_info.get('sharperatio', 0)
+        max_dd = dd_info.get('max', {}).get('drawdown', 0)
+
+        # 过滤掉极端异常值
+        if ann_ret > 200 or ann_ret < -90: return None
 
         return {
             '代码': code,
             '年化收益%': round(ann_ret, 2),
-            '夏普比率': round(sharpe or 0, 2),
+            '夏普比率': round(sharpe if sharpe else 0, 2),
             '最大回撤%': round(max_dd, 2)
         }
     except:
         return None
 
-def main():
-    data_dir = 'fund_data'
-    target_files = glob.glob(os.path.join(data_dir, "*.csv"))
-    print(f"🚀 正在按照 analyzer_V12 标准回测 {len(target_files)} 个标的...")
-    
-    with Pool(cpu_count()) as pool:
-        results = [r for r in pool.map(run_backtest, target_files) if r is not None]
-
-    if results:
-        df = pd.DataFrame(results)
-        # 排序逻辑：优先看夏普比率（稳定性），其次看年化
-        df = df.sort_values(by=['夏普比率', '年化收益%'], ascending=False)
-        df.to_csv('backtest_results.csv', index=False, encoding='utf_8_sig')
-        print(f"✅ 回测完成，报告已更新。")
-    else:
-        print("⚠️ 还是没有标的，请确认数据是否支持 min_score=4 的条件。")
-
+# --- 4. 主程序：多线程扫描 ---
 if __name__ == '__main__':
-    main()
+    data_dir = 'fund_data'
+    files = glob.glob(os.path.join(data_dir, "*.csv"))
+    print(f"🚀 开始回测，标的总数: {len(files)}")
+
+    with Pool(cpu_count()) as pool:
+        results = pool.map(run_backtest, files)
+
+    # 过滤无效结果并排序
+    valid_results = [r for r in results if r is not None and r['年化收益%'] != 0]
+    df_results = pd.DataFrame(valid_results)
+    
+    if not df_results.empty:
+        # 按照夏普比率降序，年化收益降序
+        df_results = df_results.sort_values(by=['夏普比率', '年化收益%'], ascending=False)
+        df_results.to_csv('backtest_results.csv', index=False, encoding='utf_8_sig')
+        print(f"✅ 回测报告已生成，已选出 {len(df_results)} 个有效品种。")
+    else:
+        print("❌ 未选出任何有效品种，请检查数据质量。")

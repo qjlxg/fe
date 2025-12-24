@@ -3,7 +3,7 @@ name: 003-校验
 on:
   push:
     paths:
-      - 'signal_validator.py'
+      - 'signal_validator_v2.py'
       - '.github/workflows/validate_signal.yml'
     branches: [ main ]
   workflow_dispatch: # 支持手动触发
@@ -29,10 +29,10 @@ jobs:
         python-version: '3.9'
 
     - name: Install Dependencies
-      run: pip install pandas
+      run: pip install pandas openpyxl
 
     - name: Run Validation Script
-      run: python signal_validator.py
+      run: python signal_validator_v2.py
 
     - name: Commit and Push Report
       run: |

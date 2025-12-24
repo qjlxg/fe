@@ -2,3 +2,11 @@
 1. 回测脚本 更新 backtest_results.csv优化你的选股池。
 2. 分析脚本 参考选股池  发出信号并写入 signal_history.csv。
 3. 校验脚本 读取 signal_history.csv 更新 VALIDATION_REPORT.md反馈你的真实战绩。
+
+数据体检 (data_health_check.py)：保证原材料合格。
+
+回测精英 (etf_backtest_master.py)：选出优等生。
+
+分析扫描 (analyzer_V12_Elite.py)：精准捕捉买点。
+
+战绩校验 (signal_validator_v2.py)：盯着真实盈亏。
